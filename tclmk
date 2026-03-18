@@ -75,8 +75,16 @@ proc mk::progress {done total} {
 # -----------------------------------------------------------------------------
 proc project {name body} {
     dict set ::mk::project name $name
+    # Register bare-word field commands so the body can use either:
+    #   version 0.1.0
+    # or the set-style:
+    #   set version 0.1.0
+    namespace eval ::mk::proj_ctx {
+        proc version     {v} { set ::mk::proj_ctx::version     $v }
+        proc description {v} { set ::mk::proj_ctx::description $v }
+        proc license     {v} { set ::mk::proj_ctx::license     $v }
+    }
     namespace eval ::mk::proj_ctx $body
-    # Pull values set inside the body
     foreach key {version description license} {
         if {[info exists ::mk::proj_ctx::$key]} {
             dict set ::mk::project $key [set ::mk::proj_ctx::$key]
@@ -194,13 +202,33 @@ proc dependency {name body} {
         build_cmds {} \
         inc_path   "" \
         lib_path   "" \
-        lib_name   ""]
+        lib_name   "" \
+        platforms  {}]
+
+    # Register platform sub-command inside the body
+    namespace eval ::mk::dep_ctx {
+        proc platform {pname pbody} {
+            set p [dict create build_cmds {} inc_path "" lib_path "" lib_name ""]
+            namespace eval ::mk::dep_plt_ctx $pbody
+            foreach key {build_cmds inc_path lib_path lib_name} {
+                if {[info exists ::mk::dep_plt_ctx::$key]} {
+                    dict set p $key [set ::mk::dep_plt_ctx::$key]
+                }
+            }
+            namespace delete ::mk::dep_plt_ctx
+            dict set ::mk::dep_ctx::platforms $pname $p
+        }
+        variable platforms {}
+    }
+
     namespace eval ::mk::dep_ctx $body
+
     foreach key {path url branch build_cmds inc_path lib_path lib_name} {
         if {[info exists ::mk::dep_ctx::$key]} {
             dict set dep $key [set ::mk::dep_ctx::$key]
         }
     }
+    dict set dep platforms $::mk::dep_ctx::platforms
     namespace delete ::mk::dep_ctx
     dict lappend ::mk::project deps $dep
 }
@@ -289,14 +317,14 @@ proc mk::build_cflags {tc extra_flags} {
     foreach i [mk::toolchain_get $tc includes] {
         lappend flags "-I$i"
     }
-    # Add include paths from deps
+    # Add include paths from deps, using per-platform overrides where defined
     foreach dep [dict get $::mk::project deps] {
-        set inc [dict get $dep inc_path]
-        set base [dict get $dep path]
+        set r    [mk::dep_resolve $dep $tc]
+        set inc  [dict get $r inc_path]
+        set base [mk::dep_abs_path $dep]
         if {$inc ne ""} {
             lappend flags "-I[file join $base $inc]"
         } else {
-            # inc_path blank means root of dep is the include dir
             lappend flags "-I$base"
         }
     }
@@ -309,9 +337,10 @@ proc mk::build_cflags {tc extra_flags} {
 proc mk::build_ldflags {tc} {
     set flags [mk::toolchain_get $tc ldflags]
     foreach dep [dict get $::mk::project deps] {
-        set libp [dict get $dep lib_path]
-        set libn [dict get $dep lib_name]
-        set base [dict get $dep path]
+        set r    [mk::dep_resolve $dep $tc]
+        set libp [dict get $r lib_path]
+        set libn [dict get $r lib_name]
+        set base [mk::dep_abs_path $dep]
         if {$libp ne ""} {
             lappend flags "-L[file join $base $libp]"
         }
@@ -329,8 +358,44 @@ proc mk::deps {} {
     return [dict get $::mk::project deps]
 }
 
-proc mk::dep_init {dep} {
+# Resolve effective dep values for a given toolchain, merging platform
+# overrides over top-level defaults.
+proc mk::dep_resolve {dep tc} {
+    set resolved [dict create \
+        build_cmds [dict get $dep build_cmds] \
+        inc_path   [dict get $dep inc_path] \
+        lib_path   [dict get $dep lib_path] \
+        lib_name   [dict get $dep lib_name]]
+
+    set platforms [dict get $dep platforms]
+    if {$tc ne "" && [dict exists $platforms $tc]} {
+        set plt [dict get $platforms $tc]
+        foreach key {build_cmds inc_path lib_path lib_name} {
+            set v [dict get $plt $key]
+            if {$v ne "" && $v ne {}} {
+                dict set resolved $key $v
+            }
+        }
+    }
+    return $resolved
+}
+
+proc mk::dep_sentinel {dep tc} {
     set path [dict get $dep path]
+    if {$tc ne ""} {
+        return "$path/.tclmk_built_$tc"
+    }
+    return "$path/.tclmk_built"
+}
+
+proc mk::dep_abs_path {dep} {
+    set path     [dict get $dep path]
+    set proj_dir [file dirname [file normalize $::mk::opt_project]]
+    return [file normalize [file join $proj_dir $path]]
+}
+
+proc mk::dep_init {dep} {
+    set path [mk::dep_abs_path $dep]
     set url  [dict get $dep url]
     set name [dict get $dep name]
 
@@ -339,7 +404,6 @@ proc mk::dep_init {dep} {
         return
     }
 
-    # If path missing or empty, init the submodule
     if {![file exists $path] || \
         [llength [glob -nocomplain -directory $path *]] == 0} {
         mk::log "\[GIT\] Initialising submodule $name..."
@@ -351,21 +415,22 @@ proc mk::dep_init {dep} {
     }
 }
 
-proc mk::dep_built? {dep} {
-    set path [dict get $dep path]
-    set cmds [dict get $dep build_cmds]
-    # Header-only (no build cmds): just need path to exist
-    if {$cmds eq {}} {
-        return [file exists $path]
+proc mk::dep_built? {dep tc} {
+    set r    [mk::dep_resolve $dep $tc]
+    set cmds [dict get $r build_cmds]
+    set path [mk::dep_abs_path $dep]
+    if {$cmds eq {}} { return [file exists $path] }
+    if {$tc ne ""} {
+        return [file exists "$path/.tclmk_built_$tc"]
     }
-    # Otherwise check for a sentinel file we write after a successful build
     return [file exists "$path/.tclmk_built"]
 }
 
-proc mk::dep_build {dep} {
-    set name [dict get $dep name]
-    set path [dict get $dep path]
-    set cmds [dict get $dep build_cmds]
+proc mk::dep_build {dep tc} {
+    set name     [dict get $dep name]
+    set abs_path [mk::dep_abs_path $dep]
+    set r        [mk::dep_resolve $dep $tc]
+    set cmds     [dict get $r build_cmds]
 
     if {$cmds eq {}} {
         mk::log "\[DEP\] $name: header-only, nothing to build"
@@ -373,10 +438,10 @@ proc mk::dep_build {dep} {
     }
 
     mk::log ""
-    mk::log "=== Building dependency: $name ==="
+    mk::log "=== Building dependency: $name ($tc) ==="
 
     set saved_dir [pwd]
-    cd $path
+    cd $abs_path
 
     foreach cmd $cmds {
         if {$::mk::build_cancelled} {
@@ -386,33 +451,40 @@ proc mk::dep_build {dep} {
         mk::run {*}$cmd
     }
 
-    # Write sentinel so we know it's been built
-    close [open .tclmk_built w]
     cd $saved_dir
-    mk::log "=== Done: $name ==="
+
+    set sentinel_dir [file join $abs_path build $tc]
+    file mkdir $sentinel_dir
+    if {$tc ne ""} {
+        close [open "$abs_path/.tclmk_built_$tc" w]
+    } else {
+        close [open "$abs_path/.tclmk_built" w]
+    }
+    mk::log "=== Done: $name ($tc) ==="
 }
 
 proc mk::dep_pull {dep} {
     set name [dict get $dep name]
-    set path [dict get $dep path]
+    set path [mk::dep_abs_path $dep]
     mk::log "\[GIT\] Pulling latest for $name..."
     if {[catch {
         exec git -C $path pull --ff-only
     } err]} {
         error "Pull failed for $name: $err"
     }
-    # Remove sentinel so it gets rebuilt
-    file delete -force "$path/.tclmk_built"
+    foreach sentinel [glob -nocomplain "$path/.tclmk_built*"] {
+        file delete -force $sentinel
+    }
     mk::log "\[GIT\] $name up to date — rebuild required"
 }
 
-proc mk::ensure_deps {} {
+proc mk::ensure_deps {{tc ""}} {
     set deps [mk::deps]
     if {$deps eq {}} return
     foreach dep $deps {
         mk::dep_init $dep
-        if {![mk::dep_built? $dep]} {
-            mk::dep_build $dep
+        if {![mk::dep_built? $dep $tc]} {
+            mk::dep_build $dep $tc
         }
     }
 }
@@ -549,8 +621,8 @@ proc mk::run_target {tc tname extra_flags} {
 # Build a toolchain, running the requested targets in dependency order
 # -----------------------------------------------------------------------------
 proc mk::build_toolchain {tc extra_flags {targets {}}} {
-    # Ensure all submodule deps are initialised and built first
-    mk::ensure_deps
+    # Ensure all submodule deps are initialised and built for this toolchain
+    mk::ensure_deps $tc
 
     mk::log ""
     mk::log "=== Building [string toupper $tc] ==="
@@ -845,7 +917,7 @@ proc mk::run_headless {platforms} {
         # --deps: force rebuild all
         if {$::mk::opt_deps} {
             foreach dep $deps {
-                mk::dep_build $dep
+                mk::dep_build $dep [lindex $tcs 0]
             }
             exit 0
         }
@@ -856,7 +928,7 @@ proc mk::run_headless {platforms} {
             if {$dep eq {}} {
                 mk::log "tclmk: unknown dependency '$name'"
             } else {
-                mk::dep_build $dep
+                mk::dep_build $dep [lindex $tcs 0]
             }
         }
 
@@ -1344,9 +1416,17 @@ proc mk::gui_build_deps {} {
 
 proc mk::gui_deps_async {deps} {
     set ok 1
+    set tcs [mk::enabled_platforms]
+    if {$tcs eq {}} {
+        mk::gui_log "ERROR: No platform selected — check a platform checkbox first."
+        set ::mk::gui_status "No platform selected."
+        mk::gui_build_state 0
+        return
+    }
+    set tc [lindex $tcs 0]
     foreach dep $deps {
         if {$::mk::build_cancelled} break
-        if {[catch { mk::dep_build $dep } err]} {
+        if {[catch { mk::dep_build $dep $tc } err]} {
             mk::gui_log "ERROR: $err"
             set ok 0
             break

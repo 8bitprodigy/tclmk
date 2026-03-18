@@ -151,13 +151,11 @@ toolchain <name> {
 | `outdir` | string | `build/<name>` | Output directory for objects and final binary |
 
 
-Fields are set using Tcl `set` inside the body, not as sub-commands. This is
-intentional: the body is evaluated as a namespace, so standard Tcl assignment
-applies.
+Fields inside the `project` body are written as bare-word commands — both
+`version 1.0.0` and `set version 1.0.0` are accepted, but bare-word is
+the preferred style.
 
 #### `target` (nested inside `toolchain`)
-
-Declares a named build target within the toolchain. The `binary` target is
 always implicitly defined and represents the compile+link step. Additional
 targets run arbitrary shell commands and may depend on other targets.
 

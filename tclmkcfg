@@ -44,7 +44,8 @@ namespace eval ::cfg {
     variable options {}
 
     # Dependencies: list of dicts
-    #   {name path url branch build_cmds inc_path lib_path lib_name}
+    #   {name path url branch build_cmds inc_path lib_path lib_name platforms}
+    #   platforms: dict of tc-name -> {build_cmds inc_path lib_path lib_name}
     variable deps {}
 }
 
@@ -219,8 +220,6 @@ proc cfg::serialize {} {
     }
     lappend out "\}"
     lappend out ""
-
-    # Sources block
     if {$::cfg::sources ne {}} {
         lappend out "sources \{"
         foreach entry $::cfg::sources {
@@ -279,17 +278,31 @@ proc cfg::serialize {} {
             lappend out "    set build_cmds [list $cmds]"
         }
         set inc [dict get $dep inc_path]
-        if {$inc ne ""} {
-            lappend out "    set inc_path [list $inc]"
-        }
+        if {$inc ne ""} { lappend out "    set inc_path [list $inc]" }
         set lib [dict get $dep lib_path]
-        if {$lib ne ""} {
-            lappend out "    set lib_path [list $lib]"
-        }
+        if {$lib ne ""} { lappend out "    set lib_path [list $lib]" }
         set libn [dict get $dep lib_name]
-        if {$libn ne ""} {
-            lappend out "    set lib_name [list $libn]"
+        if {$libn ne ""} { lappend out "    set lib_name [list $libn]" }
+
+        # Per-platform override blocks
+        if {[dict exists $dep platforms]} {
+            dict for {pname plt} [dict get $dep platforms] {
+                lappend out ""
+                lappend out "    platform [list $pname] \{"
+                set pcmds [dict get $plt build_cmds]
+                if {$pcmds ne {}} {
+                    lappend out "        set build_cmds [list $pcmds]"
+                }
+                foreach key {inc_path lib_path lib_name} {
+                    set v [dict get $plt $key]
+                    if {$v ne ""} {
+                        lappend out "        set $key [list $v]"
+                    }
+                }
+                lappend out "    \}"
+            }
         }
+
         lappend out "\}"
         lappend out ""
     }
@@ -370,7 +383,11 @@ proc cfg::parse_file {path} {
 
 proc cfg::dsl_project {name body} {
     dict set ::cfg::meta name $name
-    # body sets version/description/license as plain assignments
+    namespace eval ::cfg::pctx {
+        proc version     {v} { set ::cfg::pctx::version     $v }
+        proc description {v} { set ::cfg::pctx::description $v }
+        proc license     {v} { set ::cfg::pctx::license     $v }
+    }
     namespace eval ::cfg::pctx $body
     foreach key {version description license} {
         if {[info exists ::cfg::pctx::$key]} {
@@ -427,13 +444,32 @@ proc cfg::dsl_dependency {name body} {
         build_cmds {} \
         inc_path   "" \
         lib_path   "" \
-        lib_name   ""]
+        lib_name   "" \
+        platforms  {}]
+
+    namespace eval ::cfg::depctx {
+        proc platform {pname pbody} {
+            set p [dict create build_cmds {} inc_path "" lib_path "" lib_name ""]
+            namespace eval ::cfg::dep_plt_ctx $pbody
+            foreach key {build_cmds inc_path lib_path lib_name} {
+                if {[info exists ::cfg::dep_plt_ctx::$key]} {
+                    dict set p $key [set ::cfg::dep_plt_ctx::$key]
+                }
+            }
+            namespace delete ::cfg::dep_plt_ctx
+            dict set ::cfg::depctx::platforms $pname $p
+        }
+        variable platforms {}
+    }
+
     namespace eval ::cfg::depctx $body
+
     foreach key {path url branch build_cmds inc_path lib_path lib_name} {
         if {[info exists ::cfg::depctx::$key]} {
             dict set dep $key [set ::cfg::depctx::$key]
         }
     }
+    dict set dep platforms $::cfg::depctx::platforms
     namespace delete ::cfg::depctx
     lappend ::cfg::deps $dep
 }
@@ -495,7 +531,13 @@ proc cfg::refresh_all {} {
     cfg::refresh_deps
     cfg::refresh_options
     cfg::refresh_preview
+    cfg::dep_plt_refresh_checkboxes
     cfg::update_title
+}
+
+proc cfg::refresh_toolchains {} {
+    set ::cfg::tc_names [dict keys $::cfg::toolchains]
+    cfg::dep_plt_refresh_checkboxes
 }
 
 # =============================================================================
@@ -512,6 +554,11 @@ proc cfg::build_ui {} {
         -command cfg::new_project
     .mbar.file add command -label "Open..." -accelerator "Ctrl+O" \
         -command cfg::open_project
+    .mbar.file add separator
+    .mbar.file add command -label "Import CMakeLists.txt..." \
+        -command cfg::cmake_import_dialog
+    .mbar.file add command -label "Install tclmk to Project..." \
+        -command cfg::install_tclmk_dialog
     .mbar.file add separator
     .mbar.file add command -label "Save"    -accelerator "Ctrl+S" \
         -command cfg::save_project
@@ -972,10 +1019,6 @@ proc cfg::tc_dbgflag_remove {} {
     cfg::tc_refresh_dbgflags
 }
 
-proc cfg::refresh_toolchains {} {
-    set ::cfg::tc_names [dict keys $::cfg::toolchains]
-}
-
 # =============================================================================
 # Dependencies tab
 # =============================================================================
@@ -1013,20 +1056,17 @@ proc cfg::make_deps_tab {} {
     grid columnconfigure $f.list 0 -weight 1
     grid rowconfigure    $f.list 0 -weight 1
 
-    # Bottom: editor — shown when a dep is selected or being added
+    # Bottom: editor
     ttk::labelframe $f.editor -text "Dependency Settings"
 
     set row 0
 
-    # Simple text fields
+    # Fixed top-level identity fields: Name, URL, Path, Branch
     foreach {label key width hint} {
-        "Name"       dep_name   22 "Identifier used in the project"
-        "URL"        dep_url    40 "Git repository URL"
-        "Path"       dep_path   28 "Local path (default: deps/<name>)"
-        "Branch"     dep_branch 18 "Branch, tag, or commit"
-        "Inc path"   dep_inc    28 "Include path relative to dep root (for -I)"
-        "Lib path"   dep_lib    28 "Library path relative to dep root (for -L)"
-        "Lib name"   dep_libn   18 "Library name without lib prefix (for -l)"
+        "Name"   dep_name   22 "Identifier used in the project"
+        "URL"    dep_url    40 "Git repository URL"
+        "Path"   dep_path   28 "Local path (default: deps/<n>)"
+        "Branch" dep_branch 18 "Branch, tag, or commit"
     } {
         ttk::label $f.editor.lbl_$key -text "$label:" -anchor e -width 12
         ttk::entry $f.editor.ent_$key \
@@ -1041,31 +1081,76 @@ proc cfg::make_deps_tab {} {
         incr row
     }
 
-    # Build commands sub-editor
+    # Separator before platform section
+    ttk::separator $f.editor.sep -orient horizontal
+    grid $f.editor.sep -row $row -column 0 -columnspan 2 \
+        -sticky ew -padx 4 -pady 6
+    incr row
+
+    # Platform checkboxes — populated by dep_plt_refresh_checkboxes
+    ttk::frame $f.editor.plts
+    grid $f.editor.plts -row $row -column 0 -columnspan 2 \
+        -sticky ew -padx 4 -pady {0 2}
+    incr row
+
+    # Platform dropdown
+    ttk::label $f.editor.plt_lbl -text "Editing:" -anchor e -width 12
+    ttk::combobox $f.editor.plt_dd \
+        -textvariable ::cfg::dep_plt_current \
+        -values       {Default} \
+        -state        readonly \
+        -width        20
+    # Use a trace on the variable to capture the previous value
+    # before <<ComboboxSelected>> fires with the new one
+    trace add variable ::cfg::dep_plt_current write \
+        cfg::dep_plt_on_change
+    grid $f.editor.plt_lbl $f.editor.plt_dd \
+        -row $row -padx 4 -pady {0 6} -sticky ew
+    incr row
+
+    # Inc / Lib / Libname — driven by selected platform
+    foreach {label key width hint} {
+        "Inc path" plt_inc  28 "Include path relative to dep root (for -I)"
+        "Lib path" plt_lib  28 "Library path relative to dep root (for -L)"
+        "Lib name" plt_libn 18 "Library name without lib prefix (for -l)"
+    } {
+        ttk::label $f.editor.lbl_$key -text "$label:" -anchor e -width 12
+        ttk::entry $f.editor.ent_$key \
+            -textvariable ::cfg::dep_plt_edit($key) -width $width
+        ttk::label $f.editor.hint_$key -text $hint \
+            -font {TkSmallCaptionFont}
+        grid $f.editor.lbl_$key $f.editor.ent_$key \
+            -row $row -padx 4 -pady 2 -sticky ew
+        incr row
+        grid $f.editor.hint_$key -row $row -column 1 \
+            -padx 4 -pady {0 2} -sticky w
+        incr row
+    }
+
+    # Build commands — at the bottom, driven by selected platform
     ttk::label $f.editor.lbl_cmds -text "Build cmds:" -anchor e -width 12
     ttk::frame $f.editor.cmds
     listbox $f.editor.cmds.lb \
-        -listvariable ::cfg::dep_cmds_display \
+        -listvariable ::cfg::dep_plt_cmds_display \
         -height 4 -width 36 -selectmode single \
         -yscrollcommand [list $f.editor.cmds.sb set]
     ttk::scrollbar $f.editor.cmds.sb -command [list $f.editor.cmds.lb yview]
     ttk::frame $f.editor.cmds.ctrl
     ttk::entry  $f.editor.cmds.ctrl.ent \
-        -textvariable ::cfg::dep_cmd_entry -width 30
+        -textvariable ::cfg::dep_plt_cmd_entry -width 30
     ttk::button $f.editor.cmds.ctrl.add -text "Add"    \
-        -command cfg::dep_cmd_add
+        -command cfg::dep_plt_cmd_add
     ttk::button $f.editor.cmds.ctrl.del -text "Remove" \
-        -command cfg::dep_cmd_remove
-    ttk::button $f.editor.cmds.ctrl.up  -text "\u25b2"  -width 2 \
-        -command cfg::dep_cmd_up
-    ttk::button $f.editor.cmds.ctrl.dn  -text "\u25bc"  -width 2 \
-        -command cfg::dep_cmd_down
+        -command cfg::dep_plt_cmd_remove
+    ttk::button $f.editor.cmds.ctrl.up  -text "\u25b2" -width 2 \
+        -command cfg::dep_plt_cmd_up
+    ttk::button $f.editor.cmds.ctrl.dn  -text "\u25bc" -width 2 \
+        -command cfg::dep_plt_cmd_down
     pack $f.editor.cmds.ctrl.ent -side left -padx {0 4}
     pack $f.editor.cmds.ctrl.add -side left -padx 2
     pack $f.editor.cmds.ctrl.del -side left -padx 2
     pack $f.editor.cmds.ctrl.up  -side left -padx 2
     pack $f.editor.cmds.ctrl.dn  -side left -padx 2
-
     pack $f.editor.cmds.lb   -side left -fill both -expand yes
     pack $f.editor.cmds.sb   -side left -fill y
     pack $f.editor.cmds.ctrl -side bottom -anchor w -pady {4 0}
@@ -1076,9 +1161,9 @@ proc cfg::make_deps_tab {} {
     incr row
 
     ttk::label $f.editor.note \
-        -text "Header-only libs: leave build commands empty, set inc path only." \
-        -font {TkSmallCaptionFont} -foreground gray
-    grid $f.editor.note -row $row -column 0 -columnspan 2 \
+        -text "Header-only: leave build commands empty, set inc path only.\nPlatform fields: blank inherits the Default value." \
+        -font {TkSmallCaptionFont} -foreground gray -justify left
+    grid $f.editor.note -row $row -column 1 \
         -padx 4 -pady {2 4} -sticky w
     incr row
 
@@ -1095,6 +1180,9 @@ proc cfg::make_deps_tab {} {
 
     bind $f.list.tree <<TreeviewSelect>> cfg::dep_on_select
 
+    # Populate platform checkboxes now that toolchains are loaded
+    after idle cfg::dep_plt_refresh_checkboxes
+
     return $f
 }
 
@@ -1105,13 +1193,172 @@ namespace eval ::cfg {
         dep_inc  "" dep_lib "" dep_libn ""
     }
     variable dep_current      -1
-    variable dep_cmds         {}    ;# list of build command strings
-    variable dep_cmds_display {}    ;# same, for listbox -listvariable
+    variable dep_cmds         {}    ;# default build commands
+    variable dep_cmds_display {}
     variable dep_cmd_entry    ""
+    variable dep_platforms    {}    ;# dict of tc -> {build_cmds inc lib libn}
+    variable dep_plt_current  "Default"
+    variable dep_plt_prev     "Default"
+    # Per-platform editor state
+    variable dep_plt_edit
+    array set dep_plt_edit {
+        plt_inc "" plt_lib "" plt_libn ""
+    }
+    variable dep_plt_cmds         {}
+    variable dep_plt_cmds_display {}
+    variable dep_plt_cmd_entry    ""
 }
 
 proc cfg::dep_cmds_sync {} {
     set ::cfg::dep_cmds_display $::cfg::dep_cmds
+}
+
+proc cfg::dep_plt_cmds_sync {} {
+    set ::cfg::dep_plt_cmds_display $::cfg::dep_plt_cmds
+}
+
+proc cfg::dep_plt_refresh_checkboxes {} {
+    set f .nb.deps.editor.plts
+    if {![winfo exists $f]} return
+    foreach w [winfo children $f] { destroy $w }
+    ttk::label $f.lbl -text "Platform overrides:"
+    pack $f.lbl -side left -padx {0 6}
+    dict for {tc _} $::cfg::toolchains {
+        set var ::cfg::dep_plt_enabled($tc)
+        set $var [dict exists $::cfg::dep_platforms $tc]
+        ttk::checkbutton $f.cb_$tc \
+            -text     $tc \
+            -variable $var \
+            -command  [list cfg::dep_plt_toggle $tc]
+        pack $f.cb_$tc -side left -padx 4
+    }
+}
+
+proc cfg::dep_plt_toggle {tc} {
+    if {$::cfg::dep_plt_enabled($tc)} {
+        if {![dict exists $::cfg::dep_platforms $tc]} {
+            dict set ::cfg::dep_platforms $tc \
+                [dict create build_cmds {} inc_path "" lib_path "" lib_name ""]
+        }
+    } else {
+        set ::cfg::dep_platforms [dict remove $::cfg::dep_platforms $tc]
+        if {$::cfg::dep_plt_current eq $tc} {
+            cfg::dep_plt_select "Default"
+        }
+    }
+    cfg::dep_plt_update_dropdown
+}
+
+proc cfg::dep_plt_update_dropdown {} {
+    set dd .nb.deps.editor.plt_dd
+    if {![winfo exists $dd]} return
+    set values [list "Default"]
+    dict for {tc _} $::cfg::dep_platforms { lappend values $tc }
+    $dd configure -values $values
+}
+
+proc cfg::dep_plt_save {pname} {
+    if {$pname eq "Default"} {
+        set ::cfg::dep_cmds               $::cfg::dep_plt_cmds
+        set ::cfg::dep_edit(dep_inc)      $::cfg::dep_plt_edit(plt_inc)
+        set ::cfg::dep_edit(dep_lib)      $::cfg::dep_plt_edit(plt_lib)
+        set ::cfg::dep_edit(dep_libn)     $::cfg::dep_plt_edit(plt_libn)
+        return
+    }
+    set plt [dict create \
+        build_cmds $::cfg::dep_plt_cmds \
+        inc_path   [string trim $::cfg::dep_plt_edit(plt_inc)] \
+        lib_path   [string trim $::cfg::dep_plt_edit(plt_lib)] \
+        lib_name   [string trim $::cfg::dep_plt_edit(plt_libn)]]
+    dict set ::cfg::dep_platforms $pname $plt
+}
+
+proc cfg::dep_plt_load {pname} {
+    if {$pname eq "Default"} {
+        set ::cfg::dep_plt_cmds           $::cfg::dep_cmds
+        set ::cfg::dep_plt_edit(plt_inc)  $::cfg::dep_edit(dep_inc)
+        set ::cfg::dep_plt_edit(plt_lib)  $::cfg::dep_edit(dep_lib)
+        set ::cfg::dep_plt_edit(plt_libn) $::cfg::dep_edit(dep_libn)
+    } else {
+        if {[dict exists $::cfg::dep_platforms $pname]} {
+            set plt [dict get $::cfg::dep_platforms $pname]
+            set ::cfg::dep_plt_cmds           [dict get $plt build_cmds]
+            set ::cfg::dep_plt_edit(plt_inc)  [dict get $plt inc_path]
+            set ::cfg::dep_plt_edit(plt_lib)  [dict get $plt lib_path]
+            set ::cfg::dep_plt_edit(plt_libn) [dict get $plt lib_name]
+        } else {
+            set ::cfg::dep_plt_cmds {}
+            set ::cfg::dep_plt_edit(plt_inc)  ""
+            set ::cfg::dep_plt_edit(plt_lib)  ""
+            set ::cfg::dep_plt_edit(plt_libn) ""
+        }
+    }
+    cfg::dep_plt_cmds_sync
+}
+
+proc cfg::dep_plt_on_change {args} {
+    # Called when dep_plt_current changes — save old, load new
+    # We track the previous value separately to avoid the race
+    if {![info exists ::cfg::dep_plt_prev]} {
+        set ::cfg::dep_plt_prev "Default"
+    }
+    set new $::cfg::dep_plt_current
+    set old $::cfg::dep_plt_prev
+    if {$new eq $old} return
+    cfg::dep_plt_save $old
+    set ::cfg::dep_plt_prev $new
+    cfg::dep_plt_load $new
+}
+
+proc cfg::dep_plt_select {pname} {
+    # Direct select (not via combobox) — save current, switch
+    cfg::dep_plt_save $::cfg::dep_plt_current
+    set ::cfg::dep_plt_prev $pname
+    set ::cfg::dep_plt_current $pname
+    cfg::dep_plt_load $pname
+}
+
+proc cfg::dep_plt_cmd_add {} {
+    set cmd [string trim $::cfg::dep_plt_cmd_entry]
+    if {$cmd eq ""} return
+    lappend ::cfg::dep_plt_cmds $cmd
+    cfg::dep_plt_cmds_sync
+    set ::cfg::dep_plt_cmd_entry ""
+}
+
+proc cfg::dep_plt_cmd_remove {} {
+    set lb  .nb.deps.editor.cmds.lb
+    set sel [$lb curselection]
+    if {$sel eq {}} return
+    set ::cfg::dep_plt_cmds [lreplace $::cfg::dep_plt_cmds $sel $sel]
+    cfg::dep_plt_cmds_sync
+}
+
+proc cfg::dep_plt_cmd_up {} {
+    set lb  .nb.deps.editor.cmds.lb
+    set sel [$lb curselection]
+    if {$sel eq {} || $sel == 0} return
+    set prev [expr {$sel - 1}]
+    set a [lindex $::cfg::dep_plt_cmds $prev]
+    set b [lindex $::cfg::dep_plt_cmds $sel]
+    lset ::cfg::dep_plt_cmds $prev $b
+    lset ::cfg::dep_plt_cmds $sel  $a
+    cfg::dep_plt_cmds_sync
+    $lb selection set $prev
+}
+
+proc cfg::dep_plt_cmd_down {} {
+    set lb   .nb.deps.editor.cmds.lb
+    set sel  [$lb curselection]
+    set last [expr {[llength $::cfg::dep_plt_cmds] - 1}]
+    if {$sel eq {} || $sel == $last} return
+    set next [expr {$sel + 1}]
+    set a [lindex $::cfg::dep_plt_cmds $sel]
+    set b [lindex $::cfg::dep_plt_cmds $next]
+    lset ::cfg::dep_plt_cmds $sel  $b
+    lset ::cfg::dep_plt_cmds $next $a
+    cfg::dep_plt_cmds_sync
+    $lb selection set $next
 }
 
 proc cfg::dep_on_select {} {
@@ -1131,6 +1378,18 @@ proc cfg::dep_on_select {} {
     set ::cfg::dep_edit(dep_libn)   [dict get $dep lib_name]
     set ::cfg::dep_cmds             [dict get $dep build_cmds]
     cfg::dep_cmds_sync
+
+    if {[dict exists $dep platforms]} {
+        set ::cfg::dep_platforms [dict get $dep platforms]
+    } else {
+        set ::cfg::dep_platforms {}
+    }
+
+    # Reset platform editor to Default view
+    set ::cfg::dep_plt_current "Default"
+    set ::cfg::dep_plt_prev    "Default"
+    cfg::dep_plt_refresh_checkboxes
+    cfg::dep_plt_load "Default"
 }
 
 proc cfg::dep_add {} {
@@ -1143,7 +1402,12 @@ proc cfg::dep_add {} {
     set ::cfg::dep_edit(dep_lib)    ""
     set ::cfg::dep_edit(dep_libn)   ""
     set ::cfg::dep_cmds             {}
+    set ::cfg::dep_platforms        {}
+    set ::cfg::dep_plt_current      "Default"
+    set ::cfg::dep_plt_prev         "Default"
     cfg::dep_cmds_sync
+    cfg::dep_plt_refresh_checkboxes
+    cfg::dep_plt_load "Default"
 }
 
 proc cfg::dep_remove {} {
@@ -1174,6 +1438,9 @@ proc cfg::dep_apply {} {
     if {$path   eq ""} { set path   "deps/$name" }
     if {$branch eq ""} { set branch "main" }
 
+    # Save current platform editor state before applying
+    cfg::dep_plt_save $::cfg::dep_plt_current
+
     set dep [dict create \
         name       $name \
         url        $url \
@@ -1182,13 +1449,15 @@ proc cfg::dep_apply {} {
         build_cmds $::cfg::dep_cmds \
         inc_path   $inc \
         lib_path   $lib \
-        lib_name   $libn]
+        lib_name   $libn \
+        platforms  $::cfg::dep_platforms]
 
     if {$::cfg::dep_current >= 0} {
         set ::cfg::deps [lreplace $::cfg::deps \
             $::cfg::dep_current $::cfg::dep_current $dep]
     } else {
         lappend ::cfg::deps $dep
+        set ::cfg::dep_current [expr {[llength $::cfg::deps] - 1}]
     }
 
     cfg::refresh_deps
@@ -1438,6 +1707,508 @@ proc cfg::refresh_preview {} {
 proc cfg::quit {} {
     if {![cfg::confirm_discard]} return
     exit 0
+}
+
+# =============================================================================
+# CMake Importer
+# Best-effort import of CMakeLists.txt into .tclproj state.
+# Handles the most common CMake patterns; skips what it cannot parse.
+# =============================================================================
+
+namespace eval ::cmake {
+    variable vars    {}   ;# dict of CMake variable -> value
+    variable results {}   ;# list of {status msg} import report lines
+    variable project_name ""
+    variable project_version ""
+    variable sources  {}
+    variable includes {}
+    variable defines  {}
+    variable ldflags  {}
+    variable targets  {}  ;# list of executable/library target names
+}
+
+# -----------------------------------------------------------------------------
+# Expand ${VAR} references using the current variable dict
+# -----------------------------------------------------------------------------
+proc cmake::expand {input} {
+    # Build the dollar-brace-varname-brace regex via string cat
+    # to avoid Tcl brace-counting issues in the source file.
+    # chr 123 = open-brace, chr 125 = close-brace
+    set ob [format "%c" 123]
+    set cb [format "%c" 125]
+    set re [string cat {[$]} $ob "(\[^" $cb "\]+)" $cb]
+    for {set i 0} {$i < 8} {incr i} {
+        set prev   $input
+        set output ""
+        set pos    0
+        while 1 {
+            set found [regexp -start $pos -indices \
+                -- $re $input whole var]
+            if {!$found} {
+                append output [string range $input $pos end]
+                break
+            }
+            set w0 [lindex $whole 0]
+            set w1 [lindex $whole 1]
+            set v0 [lindex $var 0]
+            set v1 [lindex $var 1]
+            append output [string range $input $pos [expr {$w0 - 1}]]
+            set varname [string range $input $v0 $v1]
+            if {[dict exists $::cmake::vars $varname]} {
+                append output [dict get $::cmake::vars $varname]
+            }
+            set pos [expr {$w1 + 1}]
+        }
+        set input $output
+        if {$input eq $prev} break
+    }
+    return $input
+}
+
+# -----------------------------------------------------------------------------
+# Parse a CMake argument list — handles quoted strings and semicolon lists
+# -----------------------------------------------------------------------------
+proc cmake::parse_args {raw} {
+    # Strip comments
+    regsub {#.*$} $raw {} raw
+    set raw [string trim $raw]
+
+    set args {}
+    set current ""
+    set in_quote 0
+
+    foreach ch [split $raw {}] {
+        if {$ch eq "\"" } {
+            set in_quote [expr {!$in_quote}]
+        } elseif {($ch eq " " || $ch eq "\t" || $ch eq "\n") && !$in_quote} {
+            if {$current ne ""} {
+                if {[catch {cmake::expand $current} expanded]} {
+                    set expanded $current
+                }
+                lappend args $expanded
+                set current ""
+            }
+        } else {
+            append current $ch
+        }
+    }
+    if {$current ne ""} {
+        if {[catch {cmake::expand $current} expanded]} {
+            set expanded $current
+        }
+        lappend args $expanded
+    }
+    return $args
+}
+
+# -----------------------------------------------------------------------------
+# Log a result line
+# -----------------------------------------------------------------------------
+proc cmake::ok  {msg} { lappend ::cmake::results [list ok  $msg] }
+proc cmake::skip {msg} { lappend ::cmake::results [list skip $msg] }
+proc cmake::warn {msg} { lappend ::cmake::results [list warn $msg] }
+
+# -----------------------------------------------------------------------------
+# Process one CMake command
+# -----------------------------------------------------------------------------
+proc cmake::handle {cmd argstr} {
+    set cmd [string tolower $cmd]
+    set args [cmake::parse_args $argstr]
+
+    switch -- $cmd {
+        project {
+            set ::cmake::project_name [lindex $args 0]
+            # Look for VERSION keyword
+            set vi [lsearch $args VERSION]
+            if {$vi >= 0} {
+                set ::cmake::project_version [lindex $args $vi+1]
+            }
+            cmake::ok "project: [lindex $args 0]"
+        }
+
+        set {
+            # set(VAR value...)
+            if {[llength $args] >= 2} {
+                dict set ::cmake::vars [lindex $args 0] \
+                    [join [lrange $args 1 end] " "]
+            } elseif {[llength $args] == 1} {
+                dict unset ::cmake::vars [lindex $args 0]
+            }
+        }
+
+        add_executable -
+        add_library {
+            # add_executable(name [STATIC|SHARED] src1 src2 ...)
+            set name [lindex $args 0]
+            lappend ::cmake::targets $name
+            set srcs [lrange $args 1 end]
+            # Strip keyword args
+            set srcs [lsearch -all -inline -not $srcs \
+                -regexp {^(WIN32|MACOSX_BUNDLE|EXCLUDE_FROM_ALL|STATIC|SHARED|MODULE|INTERFACE|OBJECT)$}]
+            foreach s $srcs {
+                if {[string match *.c $s] || [string match *.cpp $s] \
+                        || [string match *.cxx $s] || [string match *.cc $s]} {
+                    lappend ::cmake::sources $s
+                }
+            }
+            cmake::ok "$cmd: $name ([llength $srcs] sources)"
+        }
+
+        target_sources {
+            # target_sources(target PRIVATE|PUBLIC|INTERFACE src...)
+            set srcs $args
+            # Remove target name and scope keywords
+            set srcs [lrange $srcs 1 end]
+            set srcs [lsearch -all -inline -not $srcs \
+                -regexp {^(PRIVATE|PUBLIC|INTERFACE)$}]
+            foreach s $srcs {
+                if {[string match *.c $s] || [string match *.cpp $s] \
+                        || [string match *.cxx $s] || [string match *.cc $s]} {
+                    lappend ::cmake::sources $s
+                }
+            }
+            cmake::ok "target_sources: [llength $srcs] sources"
+        }
+
+        include_directories {
+            set dirs $args
+            set dirs [lsearch -all -inline -not $dirs \
+                -regexp {^(BEFORE|AFTER|SYSTEM)$}]
+            foreach d $dirs { lappend ::cmake::includes $d }
+            cmake::ok "include_directories: [join $dirs {, }]"
+        }
+
+        target_include_directories {
+            # target_include_directories(target PRIVATE|PUBLIC dir...)
+            set dirs [lrange $args 1 end]
+            set dirs [lsearch -all -inline -not $dirs \
+                -regexp {^(PRIVATE|PUBLIC|INTERFACE)$}]
+            foreach d $dirs { lappend ::cmake::includes $d }
+            cmake::ok "target_include_directories: [join $dirs {, }]"
+        }
+
+        add_compile_definitions -
+        target_compile_definitions {
+            set defs $args
+            if {$cmd eq "target_compile_definitions"} {
+                set defs [lrange $defs 1 end]
+            }
+            set defs [lsearch -all -inline -not $defs \
+                -regexp {^(PRIVATE|PUBLIC|INTERFACE)$}]
+            foreach d $defs { lappend ::cmake::defines $d }
+            cmake::ok "defines: [join $defs {, }]"
+        }
+
+        target_link_libraries {
+            # target_link_libraries(target PRIVATE|PUBLIC lib...)
+            set libs [lrange $args 1 end]
+            set libs [lsearch -all -inline -not $libs \
+                -regexp {^(PRIVATE|PUBLIC|INTERFACE|LINK_PUBLIC|LINK_PRIVATE)$}]
+            foreach lib $libs {
+                # Skip cmake targets (no :: means it might be a -l flag or
+                # a plain lib name)
+                if {[string match *::* $lib]} {
+                    cmake::skip "target_link_libraries: $lib (CMake target, skipped)"
+                } else {
+                    lappend ::cmake::ldflags "-l$lib"
+                    cmake::ok "link library: $lib"
+                }
+            }
+        }
+
+        find_package {
+            cmake::skip "find_package([lindex $args 0]) — manual dependency entry required"
+        }
+
+        add_subdirectory {
+            cmake::skip "add_subdirectory([lindex $args 0]) — subdirectory not imported"
+        }
+
+        cmake_minimum_required -
+        cmake_policy -
+        enable_language -
+        enable_testing -
+        install -
+        configure_file -
+        set_target_properties -
+        set_property -
+        get_property -
+        add_definitions -
+        add_dependencies -
+        add_test -
+        if -
+        elseif -
+        else -
+        endif -
+        foreach -
+        endforeach -
+        while -
+        endwhile -
+        function -
+        endfunction -
+        macro -
+        endmacro -
+        return -
+        break -
+        continue -
+        list -
+        string -
+        math -
+        file -
+        message {}   ;# silently ignore
+
+        default {
+            # Warn only on unrecognised commands that look build-related
+            if {[string match *flag* $cmd] || [string match *option* $cmd] \
+                    || [string match *compile* $cmd]} {
+                cmake::skip "$cmd (not imported)"
+            }
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Main parser — reads the file and dispatches commands
+# -----------------------------------------------------------------------------
+proc cmake::parse {path} {
+    # Reset state
+    set ::cmake::vars           {}
+    set ::cmake::results        {}
+    set ::cmake::project_name   ""
+    set ::cmake::project_version ""
+    set ::cmake::sources        {}
+    set ::cmake::includes       {}
+    set ::cmake::defines        {}
+    set ::cmake::ldflags        {}
+    set ::cmake::targets        {}
+
+    set fh [open $path r]
+    set content [read $fh]
+    close $fh
+
+    # Join continuation lines
+    regsub -all {\\\n} $content { } content
+
+    # Strip full-line comments
+    regsub -all -line {^\s*#[^\n]*} $content {} content
+
+    # Extract commands: CommandName(args)
+    # Allow multiline args by using a lazy match
+    set pos 0
+    set len [string length $content]
+
+    while {$pos < $len} {
+        # Find next identifier followed by (
+        if {![regexp -start $pos -indices \
+                {([A-Za-z_][A-Za-z0-9_]*)\s*\(} $content match cmd_idx]} {
+            break
+        }
+
+        set cmd_start [lindex $match 0]
+        set cmd_end   [lindex $match 1]
+        set cmd       [string range $content \
+                           [lindex $cmd_idx 0] [lindex $cmd_idx 1]]
+
+        # Find matching closing paren (handle nesting)
+        set depth  1
+        set i      [expr {$cmd_end + 1}]
+        set argbuf ""
+        while {$i < $len && $depth > 0} {
+            set ch [string index $content $i]
+            if     {$ch eq "("} { incr depth }
+            elseif {$ch eq ")"} {
+                incr depth -1
+                if {$depth == 0} break
+            }
+            append argbuf $ch
+            incr i
+        }
+
+        if {[catch {cmake::handle $cmd $argbuf} err]} {
+            cmake::skip "$cmd: $err"
+        }
+        set pos [expr {$i + 1}]
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Apply parsed CMake state into cfg:: state
+# -----------------------------------------------------------------------------
+proc cmake::apply {} {
+    # Project metadata
+    if {$::cmake::project_name ne ""} {
+        dict set ::cfg::meta name    $::cmake::project_name
+        dict set ::cfg::meta version $::cmake::project_version
+    }
+
+    # Sources — deduplicate
+    set seen {}
+    foreach s $::cmake::sources {
+        if {$s ni $seen} {
+            lappend seen $s
+            lappend ::cfg::sources [dict create pat $s excl 0]
+        }
+    }
+
+    # Build a default linux-gcc toolchain from what we found
+    set tc [dict create \
+        cc              gcc \
+        cxx             g++ \
+        ar              ar \
+        cflags          {-Wall -Wextra} \
+        cxxflags        {-Wall -Wextra} \
+        ldflags         $::cmake::ldflags \
+        defines         $::cmake::defines \
+        includes        $::cmake::includes \
+        sysroot         {} \
+        opt_levels      {-O0 -O1 -O2 -O3 -Os -Oz} \
+        default_olevel  -O2 \
+        debug_flags     [dict create \
+            -g                 "GDB symbols" \
+            -fsanitize=address "AddressSanitizer"] \
+        outdir          build/linux-gcc \
+        targets         [dict create binary [dict create \
+            desc "Build binary" deps {} cmds {} default 1]]]
+
+    dict set ::cfg::toolchains linux-gcc $tc
+    cmake::ok "Created toolchain: linux-gcc"
+}
+
+# -----------------------------------------------------------------------------
+# Import dialog
+# -----------------------------------------------------------------------------
+proc cfg::cmake_import_dialog {} {
+    set path [tk_getOpenFile \
+        -title     "Import CMakeLists.txt" \
+        -filetypes {{"CMake" {CMakeLists.txt *.cmake}} {"All Files" *}}]
+    if {$path eq ""} return
+
+    # Run the parser
+    if {[catch { cmake::parse $path } err]} {
+        tk_messageBox -icon error -title "tclmkcfg" \
+            -message "Failed to parse CMake file:\n$err"
+        return
+    }
+
+    # Show results dialog before applying
+    cfg::cmake_results_dialog $path
+}
+
+proc cfg::cmake_results_dialog {path} {
+    set d [toplevel .cmake_results]
+    wm title $d "CMake Import Results"
+    wm resizable $d 1 1
+    wm minsize $d 500 360
+
+    ttk::label $d.lbl \
+        -text "Results for [file tail $path]:" \
+        -anchor w
+    pack $d.lbl -fill x -padx 8 -pady {8 2}
+
+    # Results text widget
+    text $d.txt \
+        -height 18 -width 64 \
+        -font   {TkFixedFont} \
+        -state  disabled \
+        -wrap   none \
+        -yscrollcommand [list $d.sb yview]
+    ttk::scrollbar $d.sb -command [list $d.txt yview]
+    pack $d.sb  -side right -fill y    -padx {0 4} -pady 4
+    pack $d.txt -side left  -fill both -expand yes -padx {8 0} -pady 4
+
+    # Configure tags for colour coding
+    $d.txt tag configure ok   -foreground #227722
+    $d.txt tag configure skip -foreground #aa7700
+    $d.txt tag configure warn -foreground #cc2222
+
+    $d.txt configure -state normal
+    foreach entry $::cmake::results {
+        lassign $entry status msg
+        set prefix [dict get {ok "  ✓ " skip "  ! " warn "  ✗ "} $status]
+        $d.txt insert end "$prefix$msg\n" $status
+    }
+    $d.txt configure -state disabled
+
+    # Summary line
+    set nok   [llength [lsearch -all -index 0 $::cmake::results ok]]
+    set nskip [llength [lsearch -all -index 0 $::cmake::results skip]]
+    set nwarn [llength [lsearch -all -index 0 $::cmake::results warn]]
+    ttk::label $d.summary \
+        -text "Imported: $nok   Skipped: $nskip   Warnings: $nwarn" \
+        -anchor w
+    pack $d.summary -fill x -padx 8 -pady {0 4}
+
+    # Buttons
+    ttk::frame $d.btns
+    ttk::button $d.btns.cancel -text "Cancel" \
+        -command [list destroy $d]
+    ttk::button $d.btns.apply  -text "Apply to Project" \
+        -command [list cfg::cmake_apply_and_close $d]
+    pack $d.btns.cancel -side left  -padx 4
+    pack $d.btns.apply  -side right -padx 4
+    pack $d.btns -fill x -padx 8 -pady {0 8}
+}
+
+proc cfg::cmake_apply_and_close {d} {
+    destroy $d
+    cmake::apply
+    cfg::refresh_all
+    cfg::mark_dirty
+    # Switch to the preview tab so they can see what was generated
+    .nb select .nb.preview
+}
+
+proc cfg::install_tclmk_dialog {} {
+    # Find where tclmkcfg itself lives — tclmk should be alongside it
+    set self    [file normalize [info script]]
+    set selfdir [file dirname $self]
+    set tclmk_src [file join $selfdir tclmk]
+
+    if {![file exists $tclmk_src]} {
+        # Not alongside tclmkcfg — ask the user to locate it
+        set tclmk_src [tk_getOpenFile \
+            -title     "Locate tclmk" \
+            -initialdir $selfdir \
+            -filetypes {{"tclmk" {tclmk}} {"All Files" *}}]
+        if {$tclmk_src eq ""} return
+    }
+
+    # Default destination: directory containing the current project file,
+    # falling back to cwd if no project is open yet
+    set initdir [expr {
+        $::cfg::current_file ne ""
+            ? [file dirname $::cfg::current_file]
+            : [pwd]
+    }]
+
+    set dest_dir [tk_chooseDirectory \
+        -title       "Install tclmk to..." \
+        -initialdir  $initdir]
+    if {$dest_dir eq ""} return
+
+    set dest [file join $dest_dir tclmk]
+
+    # Warn if it already exists
+    if {[file exists $dest]} {
+        set r [tk_messageBox \
+            -icon    question \
+            -type    yesno \
+            -title   "tclmkcfg" \
+            -message "tclmk already exists in [file tail $dest_dir].\nOverwrite it?"]
+        if {$r ne "yes"} return
+    }
+
+    if {[catch {
+        file copy -force $tclmk_src $dest
+        file attributes $dest -permissions 0755
+    } err]} {
+        tk_messageBox -icon error -title "tclmkcfg" \
+            -message "Failed to install tclmk:\n$err"
+        return
+    }
+
+    tk_messageBox -icon info -title "tclmkcfg" \
+        -message "tclmk installed to $dest"
 }
 
 # =============================================================================
