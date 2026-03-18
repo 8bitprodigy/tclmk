@@ -1,0 +1,1460 @@
+#!/bin/sh
+# tclmkcfg - tclmk Project Configurator
+# The next line restarts using wish \
+for interp in wish8.7 wish8.6 wish; do \
+    command -v "$interp" >/dev/null 2>&1 && exec "$interp" "$0" "$@"; \
+done; \
+echo "tclmkcfg: no Tk interpreter found (Tk is required)" >&2; exit 1
+
+# =============================================================================
+# tclmkcfg -- tclmk Project Configurator
+# Creates and edits .tclproj files for use with tclmk.
+#
+# Usage: tclmkcfg [file.tclproj]
+# =============================================================================
+
+package require Tcl 8.6
+package require Tk
+
+wm title . "tclmkcfg"
+wm minsize . 800 560
+
+# =============================================================================
+# State
+# =============================================================================
+namespace eval ::cfg {
+    # Current file on disk
+    variable current_file ""
+    variable dirty        0
+
+    # Project metadata
+    variable meta [dict create \
+        name        "" \
+        version     "0.1.0" \
+        description "" \
+        license     "0BSD"]
+
+    # Sources: list of dicts {type file|dir path path excl 0|1}
+    variable sources {}
+
+    # Toolchains: dict of name -> toolchain-dict
+    variable toolchains {}
+
+    # Options/feature flags: dict of name -> option-dict
+    variable options {}
+
+    # Dependencies: list of dicts
+    #   {name path url branch build_cmds inc_path lib_path lib_name}
+    variable deps {}
+}
+
+# =============================================================================
+# Built-in toolchain presets
+# =============================================================================
+proc cfg::presets {} {
+    return [dict create \
+        "Linux GCC" [dict create \
+            cc              gcc \
+            cxx             g++ \
+            ar              ar \
+            cflags          {-Wall -Wextra} \
+            cxxflags        {-Wall -Wextra} \
+            ldflags         {} \
+            defines         {PLATFORM_LINUX} \
+            includes        {} \
+            sysroot         {} \
+            opt_levels      {-O0 -O1 -O2 -O3 -Os -Oz} \
+            default_olevel  -O2 \
+            debug_flags     [dict create \
+                -g                 "GDB symbols" \
+                -fsanitize=address "AddressSanitizer" \
+                -pg                "gprof profiling"] \
+            outdir          build/linux-gcc] \
+        "Linux Clang" [dict create \
+            cc              clang \
+            cxx             clang++ \
+            ar              llvm-ar \
+            cflags          {-Wall -Wextra} \
+            cxxflags        {-Wall -Wextra} \
+            ldflags         {} \
+            defines         {PLATFORM_LINUX} \
+            includes        {} \
+            sysroot         {} \
+            opt_levels      {-O0 -O1 -O2 -O3 -Os -Oz} \
+            default_olevel  -O2 \
+            debug_flags     [dict create \
+                -g                 "Debug symbols" \
+                -fsanitize=address "AddressSanitizer" \
+                -fsanitize=memory  "MemorySanitizer" \
+                -pg                "Profiling"] \
+            outdir          build/linux-clang] \
+        "MinGW-w64 (Windows)" [dict create \
+            cc              x86_64-w64-mingw32-gcc \
+            cxx             x86_64-w64-mingw32-g++ \
+            ar              x86_64-w64-mingw32-ar \
+            cflags          {-Wall -Wextra} \
+            cxxflags        {-Wall -Wextra} \
+            ldflags         {-static-libgcc -static-libstdc++} \
+            defines         {PLATFORM_WINDOWS WIN32_LEAN_AND_MEAN} \
+            includes        {} \
+            sysroot         {} \
+            opt_levels      {-O0 -O1 -O2 -O3 -Os} \
+            default_olevel  -O2 \
+            debug_flags     [dict create \
+                -g  "Debug symbols" \
+                -pg "Profiling"] \
+            outdir          build/mingw-w64] \
+        "KallistiOS (Dreamcast)" [dict create \
+            cc              kos-cc \
+            cxx             kos-c++ \
+            ar              kos-ar \
+            cflags          {-ml -m4-single-only -Wall} \
+            cxxflags        {-ml -m4-single-only -Wall} \
+            ldflags         {-lkallisti -lc -lgcc} \
+            defines         {PLATFORM_DREAMCAST _arch_dreamcast} \
+            includes        {} \
+            sysroot         /opt/toolchains/dc/sh-elf \
+            opt_levels      {-O0 -O1 -O2 -Os} \
+            default_olevel  -O2 \
+            debug_flags     [dict create \
+                -g               "GDB stub symbols" \
+                FRAME_POINTERS   "KOS frame pointers" \
+                DC_SERIAL_DEBUG  "Serial port debug output"] \
+            outdir          build/dreamcast] \
+        "devkitARM (GBA)" [dict create \
+            cc              arm-none-eabi-gcc \
+            cxx             arm-none-eabi-g++ \
+            ar              arm-none-eabi-ar \
+            cflags          {-mthumb -mthumb-interwork -Wall} \
+            cxxflags        {-mthumb -mthumb-interwork -Wall} \
+            ldflags         {-specs=gba.specs} \
+            defines         {PLATFORM_GBA __GBA__} \
+            includes        {} \
+            sysroot         {} \
+            opt_levels      {-O0 -O1 -O2 -Os} \
+            default_olevel  -O2 \
+            debug_flags     [dict create \
+                -g  "Debug symbols"] \
+            outdir          build/gba] \
+        "devkitPPC (GameCube/Wii)" [dict create \
+            cc              powerpc-eabi-gcc \
+            cxx             powerpc-eabi-g++ \
+            ar              powerpc-eabi-ar \
+            cflags          {-Wall} \
+            cxxflags        {-Wall} \
+            ldflags         {} \
+            defines         {PLATFORM_GAMECUBE} \
+            includes        {} \
+            sysroot         {} \
+            opt_levels      {-O0 -O1 -O2 -O3 -Os} \
+            default_olevel  -O2 \
+            debug_flags     [dict create \
+                -g  "Debug symbols"] \
+            outdir          build/gamecube] \
+        "PSn00bSDK (PS1)" [dict create \
+            cc              mipsel-none-elf-gcc \
+            cxx             mipsel-none-elf-g++ \
+            ar              mipsel-none-elf-ar \
+            cflags          {-Wall -fno-pic -mno-abicalls} \
+            cxxflags        {-Wall -fno-pic -mno-abicalls} \
+            ldflags         {-lpsn00b} \
+            defines         {PLATFORM_PS1} \
+            includes        {} \
+            sysroot         {} \
+            opt_levels      {-O0 -O1 -O2 -Os} \
+            default_olevel  -O2 \
+            debug_flags     [dict create \
+                -g  "Debug symbols"] \
+            outdir          build/ps1] \
+        "Custom" [dict create \
+            cc              "" \
+            cxx             "" \
+            ar              ar \
+            cflags          {} \
+            cxxflags        {} \
+            ldflags         {} \
+            defines         {} \
+            includes        {} \
+            sysroot         {} \
+            opt_levels      {-O0 -O1 -O2 -O3 -Os} \
+            default_olevel  -O2 \
+            debug_flags     [dict create] \
+            outdir          build/custom]]
+}
+
+# =============================================================================
+# Dirty tracking
+# =============================================================================
+proc cfg::mark_dirty {} {
+    set ::cfg::dirty 1
+    cfg::update_title
+}
+
+proc cfg::mark_clean {} {
+    set ::cfg::dirty 0
+    cfg::update_title
+}
+
+proc cfg::update_title {} {
+    set name [dict get $::cfg::meta name]
+    set title "tclmkcfg"
+    if {$name ne ""} { append title " \u2014 $name" }
+    if {$::cfg::dirty} { append title " *" }
+    wm title . $title
+}
+
+# =============================================================================
+# .tclproj serializer
+# =============================================================================
+proc cfg::serialize {} {
+    set out {}
+
+    # Project block
+    lappend out "project [list [dict get $::cfg::meta name]] \{"
+    foreach key {version description license} {
+        set v [dict get $::cfg::meta $key]
+        if {$v ne ""} {
+            lappend out "    $key [list $v]"
+        }
+    }
+    lappend out "\}"
+    lappend out ""
+
+    # Sources block
+    if {$::cfg::sources ne {}} {
+        lappend out "sources \{"
+        foreach entry $::cfg::sources {
+            set pat [dict get $entry pat]
+            if {[dict get $entry excl]} {
+                lappend out "    exclude [list $pat]"
+            } else {
+                lappend out "    src     [list $pat]"
+            }
+        }
+        lappend out "\}"
+        lappend out ""
+    }
+
+    # Toolchain blocks
+    dict for {name tc} $::cfg::toolchains {
+        lappend out "toolchain [list $name] \{"
+        foreach key {cc cxx ar} {
+            lappend out "    set $key [list [dict get $tc $key]]"
+        }
+        # List values
+        foreach key {cflags cxxflags ldflags defines includes} {
+            set v [dict get $tc $key]
+            if {$v ne {}} {
+                lappend out "    set $key [list $v]"
+            }
+        }
+        set sr [dict get $tc sysroot]
+        if {$sr ne ""} {
+            lappend out "    set sysroot [list $sr]"
+        }
+        lappend out "    set opt_levels     [list [dict get $tc opt_levels]]"
+        lappend out "    set default_olevel [list [dict get $tc default_olevel]]"
+        # Debug flags as nested dict
+        set df [dict get $tc debug_flags]
+        if {$df ne {}} {
+            lappend out "    set debug_flags \[dict create \\"
+            dict for {flag desc} $df {
+                lappend out "        [list $flag] [list $desc] \\"
+            }
+            lappend out "    \]"
+        }
+        lappend out "    set outdir [list [dict get $tc outdir]]"
+        lappend out "\}"
+        lappend out ""
+    }
+
+    # Dependency blocks
+    foreach dep $::cfg::deps {
+        lappend out "dependency [list [dict get $dep name]] \{"
+        lappend out "    set path     [list [dict get $dep path]]"
+        lappend out "    set url      [list [dict get $dep url]]"
+        lappend out "    set branch   [list [dict get $dep branch]]"
+        set cmds [dict get $dep build_cmds]
+        if {$cmds ne {}} {
+            lappend out "    set build_cmds [list $cmds]"
+        }
+        set inc [dict get $dep inc_path]
+        if {$inc ne ""} {
+            lappend out "    set inc_path [list $inc]"
+        }
+        set lib [dict get $dep lib_path]
+        if {$lib ne ""} {
+            lappend out "    set lib_path [list $lib]"
+        }
+        set libn [dict get $dep lib_name]
+        if {$libn ne ""} {
+            lappend out "    set lib_name [list $libn]"
+        }
+        lappend out "\}"
+        lappend out ""
+    }
+
+    # Option blocks
+    dict for {name opt} $::cfg::options {
+        lappend out "option [list $name] \{"
+        lappend out "    set desc      [list [dict get $opt desc]]"
+        lappend out "    set default   [dict get $opt default]"
+        set plat [dict get $opt platforms]
+        if {$plat ne {}} {
+            lappend out "    set platforms [list $plat]"
+        }
+        lappend out "\}"
+        lappend out ""
+    }
+
+    return [join $out \n]
+}
+
+# =============================================================================
+# File I/O
+# =============================================================================
+proc cfg::new_project {} {
+    if {![cfg::confirm_discard]} return
+    set ::cfg::current_file ""
+    set ::cfg::meta [dict create name "" version "0.1.0" \
+                         description "" license "0BSD"]
+    set ::cfg::sources    {}
+    set ::cfg::toolchains {}
+    set ::cfg::options    {}
+    set ::cfg::deps       {}
+    cfg::refresh_all
+    cfg::mark_clean
+}
+
+proc cfg::open_project {{path ""}} {
+    if {![cfg::confirm_discard]} return
+    if {$path eq ""} {
+        set path [tk_getOpenFile \
+            -title   "Open Project" \
+            -filetypes {{"tclmk Project" {.tclproj}} {"All Files" *}}]
+    }
+    if {$path eq ""} return
+
+    # Reset state then parse
+    set ::cfg::meta       [dict create name "" version "" description "" license ""]
+    set ::cfg::sources    {}
+    set ::cfg::toolchains {}
+    set ::cfg::options    {}
+    set ::cfg::deps       {}
+
+    if {[catch { cfg::parse_file $path } err]} {
+        tk_messageBox -icon error -title "tclmkcfg" \
+            -message "Failed to open project:\n$err"
+        return
+    }
+
+    set ::cfg::current_file $path
+    cfg::refresh_all
+    cfg::mark_clean
+}
+
+proc cfg::parse_file {path} {
+    # We evaluate the .tclproj DSL in a safe-ish interp that intercepts
+    # the DSL commands and populates our state dicts.
+    set i [interp create -safe]
+
+    $i alias project    cfg::dsl_project
+    $i alias toolchain  cfg::dsl_toolchain
+    $i alias sources    cfg::dsl_sources
+    $i alias option     cfg::dsl_option
+    $i alias dependency cfg::dsl_dependency
+
+    $i eval [read [open $path r]]
+    interp delete $i
+}
+
+proc cfg::dsl_project {name body} {
+    dict set ::cfg::meta name $name
+    # body sets version/description/license as plain assignments
+    namespace eval ::cfg::pctx $body
+    foreach key {version description license} {
+        if {[info exists ::cfg::pctx::$key]} {
+            dict set ::cfg::meta $key [set ::cfg::pctx::$key]
+        }
+    }
+    namespace delete ::cfg::pctx
+}
+
+proc cfg::dsl_toolchain {name body} {
+    set tc [dict create \
+        cc "" cxx "" ar ar cflags {} cxxflags {} ldflags {} \
+        defines {} includes {} sysroot {} opt_levels {-O0 -O1 -O2 -O3 -Os} \
+        default_olevel -O2 debug_flags {} outdir "build/$name"]
+    namespace eval ::cfg::tctx $body
+    foreach key [dict keys $tc] {
+        if {[info exists ::cfg::tctx::$key]} {
+            dict set tc $key [set ::cfg::tctx::$key]
+        }
+    }
+    namespace delete ::cfg::tctx
+    dict set ::cfg::toolchains $name $tc
+}
+
+proc cfg::dsl_sources {body} {
+    namespace eval ::cfg::sctx {
+        proc src     {pat} { lappend ::cfg::sources \
+                                 [dict create pat $pat excl 0] }
+        proc exclude {pat} { lappend ::cfg::sources \
+                                 [dict create pat $pat excl 1] }
+    }
+    namespace eval ::cfg::sctx $body
+    namespace delete ::cfg::sctx
+}
+
+proc cfg::dsl_option {name body} {
+    set opt [dict create desc "" default 0 platforms {}]
+    namespace eval ::cfg::octx $body
+    foreach key [dict keys $opt] {
+        if {[info exists ::cfg::octx::$key]} {
+            dict set opt $key [set ::cfg::octx::$key]
+        }
+    }
+    namespace delete ::cfg::octx
+    dict set ::cfg::options $name $opt
+}
+
+proc cfg::dsl_dependency {name body} {
+    set dep [dict create \
+        name       $name \
+        path       "deps/$name" \
+        url        "" \
+        branch     "main" \
+        build_cmds {} \
+        inc_path   "" \
+        lib_path   "" \
+        lib_name   ""]
+    namespace eval ::cfg::depctx $body
+    foreach key {path url branch build_cmds inc_path lib_path lib_name} {
+        if {[info exists ::cfg::depctx::$key]} {
+            dict set dep $key [set ::cfg::depctx::$key]
+        }
+    }
+    namespace delete ::cfg::depctx
+    lappend ::cfg::deps $dep
+}
+
+proc cfg::save_project {} {
+    if {$::cfg::current_file eq ""} {
+        cfg::save_as
+        return
+    }
+    cfg::write_file $::cfg::current_file
+}
+
+proc cfg::save_as {} {
+    set name [dict get $::cfg::meta name]
+    set init [expr {$name ne "" ? "${name}.tclproj" : "build.tclproj"}]
+    set path [tk_getSaveFile \
+        -title       "Save Project As" \
+        -initialfile $init \
+        -filetypes   {{"tclmk Project" {.tclproj}} {"All Files" *}}]
+    if {$path eq ""} return
+    set ::cfg::current_file $path
+    cfg::write_file $path
+}
+
+proc cfg::write_file {path} {
+    if {[catch {
+        set f [open $path w]
+        puts $f [cfg::serialize]
+        close $f
+    } err]} {
+        tk_messageBox -icon error -title "tclmkcfg" \
+            -message "Failed to save:\n$err"
+        return
+    }
+    cfg::mark_clean
+}
+
+proc cfg::confirm_discard {} {
+    if {!$::cfg::dirty} { return 1 }
+    set r [tk_messageBox \
+        -icon    question \
+        -type    yesnocancel \
+        -title   "Unsaved Changes" \
+        -message "You have unsaved changes. Save before continuing?"]
+    switch $r {
+        yes    { cfg::save_project; return 1 }
+        no     { return 1 }
+        cancel { return 0 }
+    }
+}
+
+# =============================================================================
+# Refresh helpers — push state back into UI widgets
+# =============================================================================
+proc cfg::refresh_all {} {
+    cfg::refresh_meta
+    cfg::refresh_sources
+    cfg::refresh_toolchains
+    cfg::refresh_deps
+    cfg::refresh_options
+    cfg::refresh_preview
+    cfg::update_title
+}
+
+# =============================================================================
+# UI construction
+# =============================================================================
+proc cfg::build_ui {} {
+    # Menu bar
+    menu .mbar
+    . configure -menu .mbar
+
+    menu .mbar.file -tearoff 0
+    .mbar add cascade -label "File" -menu .mbar.file
+    .mbar.file add command -label "New"     -accelerator "Ctrl+N" \
+        -command cfg::new_project
+    .mbar.file add command -label "Open..." -accelerator "Ctrl+O" \
+        -command cfg::open_project
+    .mbar.file add separator
+    .mbar.file add command -label "Save"    -accelerator "Ctrl+S" \
+        -command cfg::save_project
+    .mbar.file add command -label "Save As..." \
+        -command cfg::save_as
+    .mbar.file add separator
+    .mbar.file add command -label "Quit"    -accelerator "Ctrl+Q" \
+        -command cfg::quit
+
+    bind . <Control-n> cfg::new_project
+    bind . <Control-o> cfg::open_project
+    bind . <Control-s> cfg::save_project
+    bind . <Control-q> cfg::quit
+    wm protocol . WM_DELETE_WINDOW cfg::quit
+
+    # Main notebook
+    ttk::notebook .nb
+    pack .nb -fill both -expand yes -padx 4 -pady 4
+
+    .nb add [cfg::make_meta_tab]       -text "Project"
+    .nb add [cfg::make_sources_tab]    -text "Sources"
+    .nb add [cfg::make_toolchains_tab] -text "Toolchains"
+    .nb add [cfg::make_deps_tab]       -text "Dependencies"
+    .nb add [cfg::make_options_tab]    -text "Options"
+    .nb add [cfg::make_preview_tab]    -text "Preview"
+}
+
+# =============================================================================
+# Project metadata tab
+# =============================================================================
+proc cfg::make_meta_tab {} {
+    set f [ttk::frame .nb.meta]
+
+    ttk::labelframe $f.fields -text "Project Info"
+    pack $f.fields -fill x -padx 8 -pady 8
+
+    set row 0
+    foreach {label key} {
+        "Name"        name
+        "Version"     version
+        "License"     license
+        "Description" description
+    } {
+        ttk::label $f.fields.lbl_$key -text "$label:" -anchor e -width 12
+        ttk::entry $f.fields.ent_$key \
+            -textvariable ::cfg::meta_$key \
+            -width 40
+        # trace writes back into the dict
+        trace add variable ::cfg::meta_$key write \
+            [list apply {{key _ _ _} {
+                dict set ::cfg::meta $key [set ::cfg::meta_$key]
+                cfg::mark_dirty
+                cfg::refresh_preview
+            }} $key]
+        grid $f.fields.lbl_$key $f.fields.ent_$key \
+            -row $row -padx 4 -pady 3 -sticky ew
+        incr row
+    }
+    grid columnconfigure $f.fields 1 -weight 1
+
+    return $f
+}
+
+proc cfg::refresh_meta {} {
+    foreach key {name version license description} {
+        set ::cfg::meta_$key [dict get $::cfg::meta $key]
+    }
+}
+
+# =============================================================================
+# Sources tab
+# =============================================================================
+proc cfg::make_sources_tab {} {
+    set f [ttk::frame .nb.sources]
+
+    # Top: pattern entry row
+    ttk::labelframe $f.entry -text "Add Source Pattern"
+    ttk::label  $f.entry.lbl -text "Pattern:"
+    ttk::entry  $f.entry.ent -textvariable ::cfg::src_pattern -width 36
+    ttk::label  $f.entry.hint \
+        -text "e.g.  src/core/*.c  or  src/main.c" \
+        -font {TkSmallCaptionFont}
+    ttk::button $f.entry.add  -text "Add \u2192"     \
+        -command {cfg::sources_add_pattern 0}
+    ttk::button $f.entry.excl -text "Exclude \u2192" \
+        -command {cfg::sources_add_pattern 1}
+    ttk::button $f.entry.browse -text "Browse..." \
+        -command cfg::sources_browse
+
+    grid $f.entry.lbl    -row 0 -column 0 -padx {4 2} -pady 4 -sticky w
+    grid $f.entry.ent    -row 0 -column 1 -padx 2     -pady 4 -sticky ew
+    grid $f.entry.add    -row 0 -column 2 -padx 2     -pady 4
+    grid $f.entry.excl   -row 0 -column 3 -padx 2     -pady 4
+    grid $f.entry.browse -row 0 -column 4 -padx {2 4} -pady 4
+    grid $f.entry.hint   -row 1 -column 1 -columnspan 4 \
+        -padx 2 -pady {0 4} -sticky w
+    grid columnconfigure $f.entry 1 -weight 1
+
+    # Bottom: pattern list
+    ttk::labelframe $f.list -text "Source Patterns"
+    ttk::treeview $f.list.tree \
+        -columns {kind pattern} \
+        -show headings \
+        -selectmode extended \
+        -yscrollcommand [list $f.list.sb set]
+    $f.list.tree heading kind    -text "Kind"    -anchor w
+    $f.list.tree heading pattern -text "Pattern" -anchor w
+    $f.list.tree column  kind    -width 70  -stretch 0
+    $f.list.tree column  pattern -width 340 -stretch 1
+    ttk::scrollbar $f.list.sb -command [list $f.list.tree yview]
+
+    ttk::button $f.list.remove -text "Remove Selected" \
+        -command cfg::sources_remove
+
+    grid $f.list.tree   $f.list.sb -sticky nsew
+    grid $f.list.remove -          -sticky e -pady {4 2} -padx 2
+    grid columnconfigure $f.list 0 -weight 1
+    grid rowconfigure    $f.list 0 -weight 1
+
+    grid $f.entry -row 0 -sticky ew   -padx 8 -pady {8 4}
+    grid $f.list  -row 1 -sticky nsew -padx 8 -pady {4 8}
+    grid columnconfigure $f 0 -weight 1
+    grid rowconfigure    $f 1 -weight 1
+
+    return $f
+}
+
+set ::cfg::src_pattern ""
+
+proc cfg::sources_add_pattern {excl} {
+    set pat [string trim $::cfg::src_pattern]
+    if {$pat eq ""} return
+    lappend ::cfg::sources [dict create pat $pat excl $excl]
+    set ::cfg::src_pattern ""
+    cfg::refresh_sources
+    cfg::mark_dirty
+    cfg::refresh_preview
+}
+
+proc cfg::sources_browse {} {
+    # Let user pick a file or directory and turn it into a pattern
+    set path [tk_getOpenFile -title "Select source file"]
+    if {$path eq ""} {
+        # Try directory instead
+        set path [tk_chooseDirectory -title "Select source directory"]
+        if {$path eq ""} return
+        set ::cfg::src_pattern "$path/*.c"
+    } else {
+        set ::cfg::src_pattern $path
+    }
+}
+
+proc cfg::sources_remove {} {
+    set tree .nb.sources.list.tree
+    set sel  [$tree selection]
+    if {$sel eq {}} return
+    set indices {}
+    foreach item $sel {
+        lappend indices [$tree index $item]
+    }
+    foreach idx [lsort -integer -decreasing $indices] {
+        set ::cfg::sources [lreplace $::cfg::sources $idx $idx]
+    }
+    cfg::refresh_sources
+    cfg::mark_dirty
+    cfg::refresh_preview
+}
+
+proc cfg::refresh_sources {} {
+    set tree .nb.sources.list.tree
+    if {![winfo exists $tree]} return
+    $tree delete [$tree children {}]
+    foreach entry $::cfg::sources {
+        set pat  [dict get $entry pat]
+        set excl [dict get $entry excl]
+        set kind [expr {$excl ? "exclude" : "src"}]
+        set tag  [expr {$excl ? "excl" : "src"}]
+        $tree insert {} end -values [list $kind $pat] -tags $tag
+    }
+    $tree tag configure excl -foreground red
+    $tree tag configure src  -foreground black
+}
+
+# =============================================================================
+# Toolchains tab
+# =============================================================================
+proc cfg::make_toolchains_tab {} {
+    set f [ttk::frame .nb.toolchains]
+
+    # Left: list of toolchains
+    ttk::labelframe $f.list -text "Toolchains"
+    listbox $f.list.lb -listvariable ::cfg::tc_names \
+        -selectmode single -height 12 -width 22 \
+        -yscrollcommand [list $f.list.sb set]
+    ttk::scrollbar $f.list.sb -command [list $f.list.lb yview]
+    pack $f.list.lb -side left  -fill both -expand yes
+    pack $f.list.sb -side right -fill y
+
+    ttk::frame $f.list.btns
+    ttk::button $f.list.btns.add    -text "Add..."  -command cfg::tc_add
+    ttk::button $f.list.btns.remove -text "Remove"  -command cfg::tc_remove
+    pack $f.list.btns.add    -side left -padx 2
+    pack $f.list.btns.remove -side left -padx 2
+    pack $f.list.btns -side bottom -fill x -pady 2
+
+    # Right: toolchain editor
+    ttk::labelframe $f.editor -text "Toolchain Settings"
+    cfg::make_tc_editor $f.editor
+
+    grid $f.list   -row 0 -column 0 -sticky nsew -padx {8 4} -pady 8
+    grid $f.editor -row 0 -column 1 -sticky nsew -padx {4 8} -pady 8
+    grid columnconfigure $f 1 -weight 1
+    grid rowconfigure    $f 0 -weight 1
+
+    bind $f.list.lb <<ListboxSelect>> cfg::tc_on_select
+
+    return $f
+}
+
+proc cfg::make_tc_editor {f} {
+    set row 0
+
+    # Preset selector at top
+    ttk::label  $f.plbl -text "Preset:" -anchor e -width 14
+    ttk::combobox $f.preset \
+        -values [dict keys [cfg::presets]] \
+        -state  readonly -width 24
+    bind $f.preset <<ComboboxSelected>> cfg::tc_apply_preset
+    grid $f.plbl $f.preset -row $row -padx 4 -pady {6 8} -sticky ew
+    incr row
+
+    ttk::separator $f.sep -orient horizontal
+    grid $f.sep -row $row -columnspan 2 -sticky ew -pady 4
+    incr row
+
+    # Name (editable)
+    ttk::label $f.nlbl -text "Name:" -anchor e -width 14
+    ttk::entry $f.name -textvariable ::cfg::tc_edit(name) -width 28
+    grid $f.nlbl $f.name -row $row -padx 4 -pady 3 -sticky ew
+    incr row
+
+    # Simple string fields
+    foreach {label key} {
+        "C Compiler"   cc
+        "C++ Compiler" cxx
+        "Archiver"     ar
+        "CFLAGS"       cflags
+        "CXXFLAGS"     cxxflags
+        "LDFLAGS"      ldflags
+        "Defines"      defines
+        "Includes"     includes
+        "Sysroot"      sysroot
+        "Output Dir"   outdir
+        "Opt Levels"   opt_levels
+        "Default -O"   default_olevel
+    } {
+        ttk::label $f.lbl_$key -text "$label:" -anchor e -width 14
+        ttk::entry $f.ent_$key \
+            -textvariable ::cfg::tc_edit($key) -width 28
+        grid $f.lbl_$key $f.ent_$key -row $row -padx 4 -pady 2 -sticky ew
+        incr row
+    }
+
+    # Debug flags sub-editor
+    ttk::label $f.dflbl -text "Debug Flags:" -anchor e -width 14
+    ttk::frame $f.dframe
+    listbox $f.dframe.lb -listvariable ::cfg::tc_dbgflag_display \
+        -height 4 -width 28 -selectmode single
+    ttk::button $f.dframe.add -text "+" -width 2 \
+        -command cfg::tc_dbgflag_add
+    ttk::button $f.dframe.del -text "\u2212" -width 2 \
+        -command cfg::tc_dbgflag_remove
+    pack $f.dframe.lb  -side left -fill both -expand yes
+    pack $f.dframe.del -side bottom -anchor s
+    pack $f.dframe.add -side bottom -anchor s
+    grid $f.dflbl $f.dframe -row $row -padx 4 -pady 2 -sticky nsew
+    incr row
+
+    # Apply/update button
+    ttk::button $f.apply -text "Apply Changes" -command cfg::tc_apply_edit
+    grid $f.apply -row $row -column 0 -columnspan 2 -pady 8
+
+    grid columnconfigure $f 1 -weight 1
+}
+
+# tc_edit holds the currently-displayed toolchain fields
+namespace eval ::cfg {
+    variable tc_edit
+    array set tc_edit {
+        name "" cc "" cxx "" ar "" cflags "" cxxflags ""
+        ldflags "" defines "" includes "" sysroot ""
+        outdir "" opt_levels "" default_olevel ""
+    }
+    variable tc_names         {}
+    variable tc_current       ""
+    variable tc_dbgflag_display {}
+    variable tc_dbgflags      {}  ;# dict flag->desc for current tc
+}
+
+proc cfg::tc_on_select {} {
+    set lb  .nb.toolchains.list.lb
+    set sel [$lb curselection]
+    if {$sel eq {}} return
+    set name [$lb get $sel]
+    cfg::tc_load_into_editor $name
+}
+
+proc cfg::tc_load_into_editor {name} {
+    set ::cfg::tc_current $name
+    set tc [dict get $::cfg::toolchains $name]
+
+    set ::cfg::tc_edit(name)          $name
+    set ::cfg::tc_edit(cc)            [dict get $tc cc]
+    set ::cfg::tc_edit(cxx)           [dict get $tc cxx]
+    set ::cfg::tc_edit(ar)            [dict get $tc ar]
+    set ::cfg::tc_edit(cflags)        [join [dict get $tc cflags] " "]
+    set ::cfg::tc_edit(cxxflags)      [join [dict get $tc cxxflags] " "]
+    set ::cfg::tc_edit(ldflags)       [join [dict get $tc ldflags] " "]
+    set ::cfg::tc_edit(defines)       [join [dict get $tc defines] " "]
+    set ::cfg::tc_edit(includes)      [join [dict get $tc includes] " "]
+    set ::cfg::tc_edit(sysroot)       [dict get $tc sysroot]
+    set ::cfg::tc_edit(outdir)        [dict get $tc outdir]
+    set ::cfg::tc_edit(opt_levels)    [join [dict get $tc opt_levels] " "]
+    set ::cfg::tc_edit(default_olevel) [dict get $tc default_olevel]
+
+    set ::cfg::tc_dbgflags [dict get $tc debug_flags]
+    cfg::tc_refresh_dbgflags
+}
+
+proc cfg::tc_refresh_dbgflags {} {
+    set ::cfg::tc_dbgflag_display {}
+    dict for {flag desc} $::cfg::tc_dbgflags {
+        lappend ::cfg::tc_dbgflag_display "$flag  \u2014  $desc"
+    }
+}
+
+proc cfg::tc_apply_edit {} {
+    set new_name [string trim $::cfg::tc_edit(name)]
+    if {$new_name eq ""} {
+        tk_messageBox -icon warning -title "tclmkcfg" \
+            -message "Toolchain name cannot be empty."
+        return
+    }
+
+    set tc [dict create \
+        cc            $::cfg::tc_edit(cc) \
+        cxx           $::cfg::tc_edit(cxx) \
+        ar            $::cfg::tc_edit(ar) \
+        cflags        [split $::cfg::tc_edit(cflags)] \
+        cxxflags      [split $::cfg::tc_edit(cxxflags)] \
+        ldflags       [split $::cfg::tc_edit(ldflags)] \
+        defines       [split $::cfg::tc_edit(defines)] \
+        includes      [split $::cfg::tc_edit(includes)] \
+        sysroot       $::cfg::tc_edit(sysroot) \
+        outdir        $::cfg::tc_edit(outdir) \
+        opt_levels    [split $::cfg::tc_edit(opt_levels)] \
+        default_olevel $::cfg::tc_edit(default_olevel) \
+        debug_flags   $::cfg::tc_dbgflags]
+
+    # Handle rename
+    if {$::cfg::tc_current ne "" && \
+        $::cfg::tc_current ne $new_name} {
+        set ::cfg::toolchains \
+            [dict remove $::cfg::toolchains $::cfg::tc_current]
+    }
+
+    dict set ::cfg::toolchains $new_name $tc
+    set ::cfg::tc_current $new_name
+    cfg::refresh_toolchains
+    cfg::mark_dirty
+    cfg::refresh_preview
+}
+
+proc cfg::tc_apply_preset {} {
+    set preset_name [.nb.toolchains.editor.preset get]
+    set preset [dict get [cfg::presets] $preset_name]
+
+    if {$preset_name eq "Custom"} {
+        set ::cfg::tc_edit(name) "custom"
+    } else {
+        set ::cfg::tc_edit(name) [string tolower \
+            [string map {{ } - / - ( {} ) {}} $preset_name]]
+    }
+
+    set ::cfg::tc_edit(cc)            [dict get $preset cc]
+    set ::cfg::tc_edit(cxx)           [dict get $preset cxx]
+    set ::cfg::tc_edit(ar)            [dict get $preset ar]
+    set ::cfg::tc_edit(cflags)        [join [dict get $preset cflags] " "]
+    set ::cfg::tc_edit(cxxflags)      [join [dict get $preset cxxflags] " "]
+    set ::cfg::tc_edit(ldflags)       [join [dict get $preset ldflags] " "]
+    set ::cfg::tc_edit(defines)       [join [dict get $preset defines] " "]
+    set ::cfg::tc_edit(includes)      [join [dict get $preset includes] " "]
+    set ::cfg::tc_edit(sysroot)       [dict get $preset sysroot]
+    set ::cfg::tc_edit(outdir)        [dict get $preset outdir]
+    set ::cfg::tc_edit(opt_levels)    [join [dict get $preset opt_levels] " "]
+    set ::cfg::tc_edit(default_olevel) [dict get $preset default_olevel]
+    set ::cfg::tc_dbgflags            [dict get $preset debug_flags]
+    cfg::tc_refresh_dbgflags
+}
+
+proc cfg::tc_add {} {
+    # Clear editor and let user fill in / choose preset
+    set ::cfg::tc_current ""
+    foreach key [array names ::cfg::tc_edit] {
+        set ::cfg::tc_edit($key) ""
+    }
+    set ::cfg::tc_edit(ar)             ar
+    set ::cfg::tc_edit(opt_levels)     "-O0 -O1 -O2 -O3 -Os"
+    set ::cfg::tc_edit(default_olevel) -O2
+    set ::cfg::tc_dbgflags {}
+    cfg::tc_refresh_dbgflags
+}
+
+proc cfg::tc_remove {} {
+    set lb  .nb.toolchains.list.lb
+    set sel [$lb curselection]
+    if {$sel eq {}} return
+    set name [$lb get $sel]
+    set ::cfg::toolchains [dict remove $::cfg::toolchains $name]
+    cfg::refresh_toolchains
+    cfg::mark_dirty
+    cfg::refresh_preview
+}
+
+proc cfg::tc_dbgflag_add {} {
+    set d [toplevel .dbgflag_add]
+    wm title $d "Add Debug Flag"
+    wm transient $d .
+    wm resizable $d 0 0
+
+    ttk::label  $d.fl -text "Flag:"
+    ttk::entry  $d.fe -textvariable ::cfg::dbgflag_new_flag -width 24
+    ttk::label  $d.dl -text "Description:"
+    ttk::entry  $d.de -textvariable ::cfg::dbgflag_new_desc -width 24
+    ttk::button $d.ok -text "Add" -command [list apply {{d} {
+        set flag [string trim $::cfg::dbgflag_new_flag]
+        set desc [string trim $::cfg::dbgflag_new_desc]
+        if {$flag ne ""} {
+            dict set ::cfg::tc_dbgflags $flag $desc
+            cfg::tc_refresh_dbgflags
+        }
+        destroy $d
+    }} $d]
+    ttk::button $d.cancel -text "Cancel" -command [list destroy $d]
+
+    grid $d.fl $d.fe     -padx 6 -pady 4 -sticky ew
+    grid $d.dl $d.de     -padx 6 -pady 4 -sticky ew
+    grid $d.ok $d.cancel -padx 6 -pady 8
+}
+
+proc cfg::tc_dbgflag_remove {} {
+    set lb  .nb.toolchains.editor.dframe.lb
+    set sel [$lb curselection]
+    if {$sel eq {}} return
+    set line [$lb get $sel]
+    set flag [string trim [lindex [split $line \u2014] 0]]
+    set ::cfg::tc_dbgflags [dict remove $::cfg::tc_dbgflags $flag]
+    cfg::tc_refresh_dbgflags
+}
+
+proc cfg::refresh_toolchains {} {
+    set ::cfg::tc_names [dict keys $::cfg::toolchains]
+}
+
+# =============================================================================
+# Dependencies tab
+# =============================================================================
+# =============================================================================
+# Dependencies tab
+# =============================================================================
+proc cfg::make_deps_tab {} {
+    set f [ttk::frame .nb.deps]
+
+    # Top: dependency list
+    ttk::labelframe $f.list -text "Git Submodule Dependencies"
+
+    ttk::treeview $f.list.tree \
+        -columns {name url branch} \
+        -show headings \
+        -selectmode browse \
+        -height 6 \
+        -yscrollcommand [list $f.list.sb set]
+    $f.list.tree heading name   -text "Name"   -anchor w
+    $f.list.tree heading url    -text "URL"    -anchor w
+    $f.list.tree heading branch -text "Branch" -anchor w
+    $f.list.tree column  name   -width 120 -stretch 0
+    $f.list.tree column  url    -width 280 -stretch 1
+    $f.list.tree column  branch -width 80  -stretch 0
+    ttk::scrollbar $f.list.sb -command [list $f.list.tree yview]
+
+    ttk::frame $f.list.btns
+    ttk::button $f.list.btns.add    -text "Add"    -command cfg::dep_add
+    ttk::button $f.list.btns.remove -text "Remove" -command cfg::dep_remove
+    pack $f.list.btns.add    -side left -padx {0 2}
+    pack $f.list.btns.remove -side left
+
+    grid $f.list.tree $f.list.sb -sticky nsew
+    grid $f.list.btns -          -sticky ew   -pady {4 0}
+    grid columnconfigure $f.list 0 -weight 1
+    grid rowconfigure    $f.list 0 -weight 1
+
+    # Bottom: editor — shown when a dep is selected or being added
+    ttk::labelframe $f.editor -text "Dependency Settings"
+
+    set row 0
+
+    # Simple text fields
+    foreach {label key width hint} {
+        "Name"       dep_name   22 "Identifier used in the project"
+        "URL"        dep_url    40 "Git repository URL"
+        "Path"       dep_path   28 "Local path (default: deps/<name>)"
+        "Branch"     dep_branch 18 "Branch, tag, or commit"
+        "Inc path"   dep_inc    28 "Include path relative to dep root (for -I)"
+        "Lib path"   dep_lib    28 "Library path relative to dep root (for -L)"
+        "Lib name"   dep_libn   18 "Library name without lib prefix (for -l)"
+    } {
+        ttk::label $f.editor.lbl_$key -text "$label:" -anchor e -width 12
+        ttk::entry $f.editor.ent_$key \
+            -textvariable ::cfg::dep_edit($key) -width $width
+        ttk::label $f.editor.hint_$key -text $hint \
+            -font {TkSmallCaptionFont}
+        grid $f.editor.lbl_$key $f.editor.ent_$key \
+            -row $row -padx 4 -pady 2 -sticky ew
+        incr row
+        grid $f.editor.hint_$key -row $row -column 1 \
+            -padx 4 -pady {0 2} -sticky w
+        incr row
+    }
+
+    # Build commands sub-editor
+    ttk::label $f.editor.lbl_cmds -text "Build cmds:" -anchor e -width 12
+    ttk::frame $f.editor.cmds
+    listbox $f.editor.cmds.lb \
+        -listvariable ::cfg::dep_cmds_display \
+        -height 4 -width 36 -selectmode single \
+        -yscrollcommand [list $f.editor.cmds.sb set]
+    ttk::scrollbar $f.editor.cmds.sb -command [list $f.editor.cmds.lb yview]
+    ttk::frame $f.editor.cmds.ctrl
+    ttk::entry  $f.editor.cmds.ctrl.ent \
+        -textvariable ::cfg::dep_cmd_entry -width 30
+    ttk::button $f.editor.cmds.ctrl.add -text "Add"    \
+        -command cfg::dep_cmd_add
+    ttk::button $f.editor.cmds.ctrl.del -text "Remove" \
+        -command cfg::dep_cmd_remove
+    ttk::button $f.editor.cmds.ctrl.up  -text "\u25b2"  -width 2 \
+        -command cfg::dep_cmd_up
+    ttk::button $f.editor.cmds.ctrl.dn  -text "\u25bc"  -width 2 \
+        -command cfg::dep_cmd_down
+    pack $f.editor.cmds.ctrl.ent -side left -padx {0 4}
+    pack $f.editor.cmds.ctrl.add -side left -padx 2
+    pack $f.editor.cmds.ctrl.del -side left -padx 2
+    pack $f.editor.cmds.ctrl.up  -side left -padx 2
+    pack $f.editor.cmds.ctrl.dn  -side left -padx 2
+
+    pack $f.editor.cmds.lb   -side left -fill both -expand yes
+    pack $f.editor.cmds.sb   -side left -fill y
+    pack $f.editor.cmds.ctrl -side bottom -anchor w -pady {4 0}
+
+    grid $f.editor.lbl_cmds $f.editor.cmds \
+        -row $row -padx 4 -pady 4 -sticky nsew
+    grid rowconfigure $f.editor $row -weight 1
+    incr row
+
+    ttk::label $f.editor.note \
+        -text "Header-only libs: leave build commands empty, set inc path only." \
+        -font {TkSmallCaptionFont} -foreground gray
+    grid $f.editor.note -row $row -column 0 -columnspan 2 \
+        -padx 4 -pady {2 4} -sticky w
+    incr row
+
+    ttk::button $f.editor.apply -text "Apply" -command cfg::dep_apply
+    grid $f.editor.apply -row $row -column 0 -columnspan 2 -pady 6
+
+    grid columnconfigure $f.editor 1 -weight 1
+
+    # Stack list on top, editor below
+    grid $f.list   -row 0 -sticky nsew -padx 8 -pady {8 4}
+    grid $f.editor -row 1 -sticky nsew -padx 8 -pady {4 8}
+    grid rowconfigure $f 1 -weight 1
+    grid columnconfigure $f 0 -weight 1
+
+    bind $f.list.tree <<TreeviewSelect>> cfg::dep_on_select
+
+    return $f
+}
+
+namespace eval ::cfg {
+    variable dep_edit
+    array set dep_edit {
+        dep_name "" dep_url "" dep_path "" dep_branch "main"
+        dep_inc  "" dep_lib "" dep_libn ""
+    }
+    variable dep_current      -1
+    variable dep_cmds         {}    ;# list of build command strings
+    variable dep_cmds_display {}    ;# same, for listbox -listvariable
+    variable dep_cmd_entry    ""
+}
+
+proc cfg::dep_cmds_sync {} {
+    set ::cfg::dep_cmds_display $::cfg::dep_cmds
+}
+
+proc cfg::dep_on_select {} {
+    set tree .nb.deps.list.tree
+    set sel  [$tree selection]
+    if {$sel eq {}} return
+    set idx [$tree index $sel]
+    set dep [lindex $::cfg::deps $idx]
+    set ::cfg::dep_current $idx
+
+    set ::cfg::dep_edit(dep_name)   [dict get $dep name]
+    set ::cfg::dep_edit(dep_url)    [dict get $dep url]
+    set ::cfg::dep_edit(dep_path)   [dict get $dep path]
+    set ::cfg::dep_edit(dep_branch) [dict get $dep branch]
+    set ::cfg::dep_edit(dep_inc)    [dict get $dep inc_path]
+    set ::cfg::dep_edit(dep_lib)    [dict get $dep lib_path]
+    set ::cfg::dep_edit(dep_libn)   [dict get $dep lib_name]
+    set ::cfg::dep_cmds             [dict get $dep build_cmds]
+    cfg::dep_cmds_sync
+}
+
+proc cfg::dep_add {} {
+    set ::cfg::dep_current -1
+    set ::cfg::dep_edit(dep_name)   ""
+    set ::cfg::dep_edit(dep_url)    ""
+    set ::cfg::dep_edit(dep_path)   ""
+    set ::cfg::dep_edit(dep_branch) "main"
+    set ::cfg::dep_edit(dep_inc)    ""
+    set ::cfg::dep_edit(dep_lib)    ""
+    set ::cfg::dep_edit(dep_libn)   ""
+    set ::cfg::dep_cmds             {}
+    cfg::dep_cmds_sync
+}
+
+proc cfg::dep_remove {} {
+    set tree .nb.deps.list.tree
+    set sel  [$tree selection]
+    if {$sel eq {}} return
+    set idx [$tree index $sel]
+    set ::cfg::deps [lreplace $::cfg::deps $idx $idx]
+    cfg::refresh_deps
+    cfg::mark_dirty
+    cfg::refresh_preview
+}
+
+proc cfg::dep_apply {} {
+    set name   [string trim $::cfg::dep_edit(dep_name)]
+    set url    [string trim $::cfg::dep_edit(dep_url)]
+    set path   [string trim $::cfg::dep_edit(dep_path)]
+    set branch [string trim $::cfg::dep_edit(dep_branch)]
+    set inc    [string trim $::cfg::dep_edit(dep_inc)]
+    set lib    [string trim $::cfg::dep_edit(dep_lib)]
+    set libn   [string trim $::cfg::dep_edit(dep_libn)]
+
+    if {$name eq ""} {
+        tk_messageBox -icon warning -title "tclmkcfg" \
+            -message "Dependency name cannot be empty."
+        return
+    }
+    if {$path   eq ""} { set path   "deps/$name" }
+    if {$branch eq ""} { set branch "main" }
+
+    set dep [dict create \
+        name       $name \
+        url        $url \
+        path       $path \
+        branch     $branch \
+        build_cmds $::cfg::dep_cmds \
+        inc_path   $inc \
+        lib_path   $lib \
+        lib_name   $libn]
+
+    if {$::cfg::dep_current >= 0} {
+        set ::cfg::deps [lreplace $::cfg::deps \
+            $::cfg::dep_current $::cfg::dep_current $dep]
+    } else {
+        lappend ::cfg::deps $dep
+    }
+
+    cfg::refresh_deps
+    cfg::mark_dirty
+    cfg::refresh_preview
+}
+
+# Build command list management
+proc cfg::dep_cmd_add {} {
+    set cmd [string trim $::cfg::dep_cmd_entry]
+    if {$cmd eq ""} return
+    lappend ::cfg::dep_cmds $cmd
+    cfg::dep_cmds_sync
+    set ::cfg::dep_cmd_entry ""
+}
+
+proc cfg::dep_cmd_remove {} {
+    set lb  .nb.deps.editor.cmds.lb
+    set sel [$lb curselection]
+    if {$sel eq {}} return
+    set ::cfg::dep_cmds [lreplace $::cfg::dep_cmds $sel $sel]
+    cfg::dep_cmds_sync
+}
+
+proc cfg::dep_cmd_up {} {
+    set lb  .nb.deps.editor.cmds.lb
+    set sel [$lb curselection]
+    if {$sel eq {} || $sel == 0} return
+    set prev [expr {$sel - 1}]
+    set a [lindex $::cfg::dep_cmds $prev]
+    set b [lindex $::cfg::dep_cmds $sel]
+    lset ::cfg::dep_cmds $prev $b
+    lset ::cfg::dep_cmds $sel  $a
+    cfg::dep_cmds_sync
+    $lb selection set $prev
+}
+
+proc cfg::dep_cmd_down {} {
+    set lb  .nb.deps.editor.cmds.lb
+    set sel [$lb curselection]
+    set last [expr {[llength $::cfg::dep_cmds] - 1}]
+    if {$sel eq {} || $sel == $last} return
+    set next [expr {$sel + 1}]
+    set a [lindex $::cfg::dep_cmds $sel]
+    set b [lindex $::cfg::dep_cmds $next]
+    lset ::cfg::dep_cmds $sel  $b
+    lset ::cfg::dep_cmds $next $a
+    cfg::dep_cmds_sync
+    $lb selection set $next
+}
+
+proc cfg::refresh_deps {} {
+    set tree .nb.deps.list.tree
+    if {![winfo exists $tree]} return
+    $tree delete [$tree children {}]
+    foreach dep $::cfg::deps {
+        $tree insert {} end -values [list \
+            [dict get $dep name] \
+            [dict get $dep url] \
+            [dict get $dep branch]]
+    }
+}
+
+# =============================================================================
+# Options tab
+# =============================================================================
+proc cfg::make_options_tab {} {
+    set f [ttk::frame .nb.options]
+
+    # Left: options list
+    ttk::labelframe $f.list -text "Feature Options"
+    listbox $f.list.lb -listvariable ::cfg::opt_names \
+        -selectmode single -height 12 -width 24 \
+        -yscrollcommand [list $f.list.sb set]
+    ttk::scrollbar $f.list.sb -command [list $f.list.lb yview]
+    pack $f.list.lb -side left  -fill both -expand yes
+    pack $f.list.sb -side right -fill y
+
+    ttk::frame $f.list.btns
+    ttk::button $f.list.btns.add    -text "Add"    -command cfg::opt_add
+    ttk::button $f.list.btns.remove -text "Remove" -command cfg::opt_remove
+    pack $f.list.btns.add    -side left -padx 2
+    pack $f.list.btns.remove -side left -padx 2
+    pack $f.list.btns -side bottom -fill x -pady 2
+
+    # Right: option editor
+    ttk::labelframe $f.editor -text "Option Settings"
+
+    set row 0
+    foreach {label key width} {
+        "Name"        opt_name   20
+        "Description" opt_desc   32
+    } {
+        ttk::label $f.editor.lbl_$key -text "$label:" -anchor e -width 14
+        ttk::entry $f.editor.ent_$key \
+            -textvariable ::cfg::opt_edit($key) -width $width
+        grid $f.editor.lbl_$key $f.editor.ent_$key \
+            -row $row -padx 4 -pady 3 -sticky ew
+        incr row
+    }
+
+    ttk::label $f.editor.lbl_def -text "Default:" -anchor e -width 14
+    ttk::combobox $f.editor.ent_opt_default \
+        -textvariable ::cfg::opt_edit(opt_default) \
+        -values {0 1} -state readonly -width 4
+    grid $f.editor.lbl_def $f.editor.ent_opt_default \
+        -row $row -padx 4 -pady 3 -sticky w
+    incr row
+
+    ttk::label $f.editor.lbl_plat \
+        -text "Platforms:" -anchor e -width 14
+    ttk::entry $f.editor.ent_opt_platforms \
+        -textvariable ::cfg::opt_edit(opt_platforms) -width 32
+    ttk::label $f.editor.hint_plat \
+        -text "(space-separated, blank = all)" \
+        -font {TkSmallCaptionFont}
+    grid $f.editor.lbl_plat $f.editor.ent_opt_platforms \
+        -row $row -padx 4 -pady 3 -sticky ew
+    incr row
+    grid $f.editor.hint_plat -row $row -column 1 -padx 4 -sticky w
+    incr row
+
+    ttk::button $f.editor.apply -text "Apply" -command cfg::opt_apply
+    grid $f.editor.apply -row $row -column 0 -columnspan 2 -pady 8
+
+    grid columnconfigure $f.editor 1 -weight 1
+
+    grid $f.list   -row 0 -column 0 -sticky nsew -padx {8 4} -pady 8
+    grid $f.editor -row 0 -column 1 -sticky nsew -padx {4 8} -pady 8
+    grid columnconfigure $f 1 -weight 1
+    grid rowconfigure    $f 0 -weight 1
+
+    bind $f.list.lb <<ListboxSelect>> cfg::opt_on_select
+
+    return $f
+}
+
+namespace eval ::cfg {
+    variable opt_names {}
+    variable opt_current ""
+    variable opt_edit
+    array set opt_edit {opt_name "" opt_desc "" opt_default 0 opt_platforms ""}
+}
+
+proc cfg::opt_on_select {} {
+    set lb  .nb.options.list.lb
+    set sel [$lb curselection]
+    if {$sel eq {}} return
+    set name [$lb get $sel]
+    set ::cfg::opt_current $name
+    set opt [dict get $::cfg::options $name]
+    set ::cfg::opt_edit(opt_name)      $name
+    set ::cfg::opt_edit(opt_desc)      [dict get $opt desc]
+    set ::cfg::opt_edit(opt_default)   [dict get $opt default]
+    set ::cfg::opt_edit(opt_platforms) [join [dict get $opt platforms] " "]
+}
+
+proc cfg::opt_add {} {
+    set ::cfg::opt_current ""
+    set ::cfg::opt_edit(opt_name)      ""
+    set ::cfg::opt_edit(opt_desc)      ""
+    set ::cfg::opt_edit(opt_default)   0
+    set ::cfg::opt_edit(opt_platforms) ""
+}
+
+proc cfg::opt_remove {} {
+    set lb  .nb.options.list.lb
+    set sel [$lb curselection]
+    if {$sel eq {}} return
+    set name [$lb get $sel]
+    set ::cfg::options [dict remove $::cfg::options $name]
+    cfg::refresh_options
+    cfg::mark_dirty
+    cfg::refresh_preview
+}
+
+proc cfg::opt_apply {} {
+    set name [string trim $::cfg::opt_edit(opt_name)]
+    if {$name eq ""} {
+        tk_messageBox -icon warning -title "tclmkcfg" \
+            -message "Option name cannot be empty."
+        return
+    }
+
+    set opt [dict create \
+        desc      $::cfg::opt_edit(opt_desc) \
+        default   $::cfg::opt_edit(opt_default) \
+        platforms [split $::cfg::opt_edit(opt_platforms)]]
+
+    if {$::cfg::opt_current ne "" && $::cfg::opt_current ne $name} {
+        set ::cfg::options [dict remove $::cfg::options $::cfg::opt_current]
+    }
+
+    dict set ::cfg::options $name $opt
+    set ::cfg::opt_current $name
+    cfg::refresh_options
+    cfg::mark_dirty
+    cfg::refresh_preview
+}
+
+proc cfg::refresh_options {} {
+    set ::cfg::opt_names [dict keys $::cfg::options]
+}
+
+# =============================================================================
+# Preview tab
+# =============================================================================
+proc cfg::make_preview_tab {} {
+    set f [ttk::frame .nb.preview]
+
+    ttk::labelframe $f.txt -text "Generated .tclproj"
+    text $f.txt.t \
+        -font              {TkFixedFont} \
+        -state             disabled \
+        -wrap              none \
+        -yscrollcommand    [list $f.txt.sb  set] \
+        -xscrollcommand    [list $f.txt.sbx set]
+    ttk::scrollbar $f.txt.sb  -orient vertical   -command [list $f.txt.t yview]
+    ttk::scrollbar $f.txt.sbx -orient horizontal -command [list $f.txt.t xview]
+
+    grid $f.txt.t   $f.txt.sb  -sticky nsew
+    grid $f.txt.sbx            -sticky ew
+    grid columnconfigure $f.txt 0 -weight 1
+    grid rowconfigure    $f.txt 0 -weight 1
+
+    pack $f.txt -fill both -expand yes -padx 8 -pady 8
+
+    # Keep ref for refresh
+    set ::cfg::preview_widget $f.txt.t
+
+    return $f
+}
+
+proc cfg::refresh_preview {} {
+    if {![info exists ::cfg::preview_widget] || \
+        ![winfo exists $::cfg::preview_widget]} return
+    set txt $::cfg::preview_widget
+    $txt configure -state normal
+    $txt delete 1.0 end
+    $txt insert end [cfg::serialize]
+    $txt configure -state disabled
+}
+
+# =============================================================================
+# Quit
+# =============================================================================
+proc cfg::quit {} {
+    if {![cfg::confirm_discard]} return
+    exit 0
+}
+
+# =============================================================================
+# Entry point
+# =============================================================================
+cfg::build_ui
+
+# Load file from command line if provided
+if {[llength $argv] > 0} {
+    set f [lindex $argv 0]
+    if {[file exists $f]} {
+        cfg::open_project $f
+    } else {
+        # Treat as new project filename
+        set ::cfg::current_file $f
+        cfg::update_title
+    }
+} else {
+    cfg::refresh_all
+}
