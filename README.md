@@ -88,18 +88,18 @@ Running `tclmk` with no arguments opens the GUI if Tk is available.
 ├─────────────────────────────────────────────────┤
 │ [Platforms] [linux-gcc] [dreamcast-kos]         │
 ├─────────────────────────────────────────────────┤
-│  Build for:                                      │
+│  Build for:                                     │
 │    ☑ linux-gcc                                  │
 │    ☑ dreamcast-kos                              │
-│                                                  │
+│                                                 │
 │  ┌─ Build Log ───────────────────────────────┐  │
 │  │ [CC] src/main.c                           │  │
-│  │ [LD] build/linux-gcc/mygame              │  │
+│  │ [LD] build/linux-gcc/mygame               │  │
 │  └───────────────────────────────────────────┘  │
 ├─────────────────────────────────────────────────┤
 │  [████████████░░░░░] Compiling src/core/foo.c   │
 ├─────────────────────────────────────────────────┤
-│  [Cancel]        [Clean] [Export Makefile] [Build]│
+│[Cancel]        [Clean] [Export Makefile] [Build]│
 └─────────────────────────────────────────────────┘
 ```
 
